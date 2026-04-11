@@ -1,0 +1,12 @@
+{
+  "name": "proxy-adaptateur-legifrance-judilibre-v4",
+  "version": "4.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
