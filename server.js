@@ -1,21 +1,22 @@
 import express from "express";
 
 const app = express();
-app.use(express.json());
 
-const PORT = 3000;
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-const CLIENT_ID = "5903add5-aaa8-4372-acbc-f16913450ac3";
-const CLIENT_SECRET = "acaebcc4-d1f9-4b7d-b518-1307bd05e0d6";
+const PORT = process.env.PORT || 3000;
+const CLIENT_ID = process.env.CLIENT_ID || "5903add5-aaa8-4372-acbc-f16913450ac3";
+const CLIENT_SECRET = process.env.CLIENT_SECRET || "acaebcc4-d1f9-4b7d-b518-1307bd05e0d6";
 
-let token = null;
+let accessToken = null;
 let tokenExpiry = 0;
 
 async function getToken() {
   const now = Date.now();
 
-  if (token && now < tokenExpiry) {
-    return token;
+  if (accessToken && now < tokenExpiry) {
+    return accessToken;
   }
 
   const body = new URLSearchParams({
@@ -33,70 +34,100 @@ async function getToken() {
     body
   });
 
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Token error ${response.status}: ${text}`);
+  }
+
   const data = await response.json();
 
-  token = data.access_token;
+  if (!data.access_token) {
+    throw new Error("Token error: access_token manquant");
+  }
+
+  accessToken = data.access_token;
   tokenExpiry = now + ((data.expires_in || 3600) - 60) * 1000;
 
-  return token;
+  return accessToken;
 }
 
-async function callPiste(path, method, payload) {
-  const accessToken = await getToken();
+function buildTargetUrl(path, queryString = "") {
+  return `https://sandbox-api.piste.gouv.fr${path}${queryString ? `?${queryString}` : ""}`;
+}
 
-  const response = await fetch(`https://sandbox-api.piste.gouv.fr${path}`, {
-    method,
-    headers: {
-      "Authorization": `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
-    },
-    body: payload ? JSON.stringify(payload) : undefined
-  });
-
-  const text = await response.text();
-
+async function forwardRequest(req, res, path) {
   try {
-    return JSON.parse(text);
-  } catch {
-    return text;
+    const token = await getToken();
+    const queryString = new URLSearchParams(req.query).toString();
+    const targetUrl = buildTargetUrl(path, queryString);
+
+    const headers = {
+      Authorization: `Bearer ${token}`
+    };
+
+    const method = req.method.toUpperCase();
+    let body;
+
+    if (method !== "GET" && method !== "HEAD") {
+      headers["Content-Type"] = "application/json";
+      body = Object.keys(req.body || {}).length ? JSON.stringify(req.body) : undefined;
+    }
+
+    const response = await fetch(targetUrl, {
+      method,
+      headers,
+      body
+    });
+
+    const contentType = response.headers.get("content-type") || "";
+    const text = await response.text();
+
+    res.status(response.status);
+
+    if (contentType.includes("application/json")) {
+      res.setHeader("Content-Type", "application/json");
+      return res.send(text);
+    }
+
+    if (contentType) {
+      res.setHeader("Content-Type", contentType);
+    }
+
+    return res.send(text);
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: String(error.message || error)
+    });
   }
 }
 
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/legal/research", async (req, res) => {
-  try {
-    const question = req.body.question;
+app.all("/dila/legifrance/lf-engine-app/*rest", async (req, res) => {
+  const rest = req.params.rest || "";
+  const path = `/dila/legifrance/lf-engine-app/${rest}`;
+  return forwardRequest(req, res, path);
+});
 
-    const [texts, cases] = await Promise.all([
-      callPiste("/dila/legifrance/lf-engine-app/search", "POST", {
-        query: question,
-        pageNumber: 0,
-        pageSize: 5
-      }),
-      callPiste("/cassation/judilibre/v1.0/search", "POST", {
-        query: question,
-        pageNumber: 0,
-        pageSize: 5
-      })
-    ]);
+app.all("/dila/legifrance/lf-engine-app", async (req, res) => {
+  const path = "/dila/legifrance/lf-engine-app";
+  return forwardRequest(req, res, path);
+});
 
-    res.json({
-      ok: true,
-      question,
-      texts,
-      cases
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: String(e)
-    });
-  }
+app.all("/cassation/judilibre/v1.0/*rest", async (req, res) => {
+  const rest = req.params.rest || "";
+  const path = `/cassation/judilibre/v1.0/${rest}`;
+  return forwardRequest(req, res, path);
+});
+
+app.all("/cassation/judilibre/v1.0", async (req, res) => {
+  const path = "/cassation/judilibre/v1.0";
+  return forwardRequest(req, res, path);
 });
 
 app.listen(PORT, () => {
-  console.log(`Proxy lancé sur http://localhost:${PORT}`);
+  console.log(`Proxy complet lancé sur http://localhost:${PORT}`);
 });
