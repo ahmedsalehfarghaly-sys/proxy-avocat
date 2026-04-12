@@ -1,0 +1,12 @@
+{
+  "name": "proxy-avocat-v3",
+  "version": "3.3.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
