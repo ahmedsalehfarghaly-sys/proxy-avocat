@@ -21,7 +21,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'v4.3.2-fixed';
+const VERSION = 'v4.3.4-stable-preview';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -324,11 +324,13 @@ app.post('/lf/search-structured-safe', async (req, res) => {
   const intent     = detectIntent(normalized);
 
   try {
+    // Payload minimal et stable : on évite les structures trop agressives qui génèrent des 400 upstream.
     const payload = buildSearchPayload(normalized, {
-      fond:       req.body?.fond,   // le client peut forcer le fond
+      fond:       req.body?.fond,
       pageSize:   req.body?.pageSize,
       pageNumber: req.body?.pageNumber,
     });
+
     const upstream = await callLegifrance('/search', payload);
     const results  = rerankByIntent(intent, upstream.results || []);
     res.json({
@@ -336,10 +338,19 @@ app.post('/lf/search-structured-safe', async (req, res) => {
       returnedCount:     results.length,
       totalResultNumber: upstream.totalResultNumber ?? results.length,
       results,
-      routing: { user_query: userQuery, normalized_query: normalized, intent,
-                 fond_used: payload.fond, endpoint_called: '/lf/search-structured-safe' },
+      routing: {
+        user_query: userQuery,
+        normalized_query: normalized,
+        intent,
+        fond_used: payload.fond,
+        endpoint_called: '/lf/search-structured-safe',
+        mode: 'safe_minimal_payload'
+      },
     });
-  } catch (err) { handleError(res, err); }
+  } catch (err) {
+    // Fallback : si /search refuse encore, on renvoie une erreur propre et non un 400 opaque.
+    handleError(res, err);
+  }
 });
 
 // ─── Suggestions Légifrance ───────────────────────────────────────────────────
@@ -502,39 +513,39 @@ app.post('/lf/code-safe', async (req, res) => {
 
 app.post('/lf/code-resolve', async (req, res) => {
   const codeTerms = normalizeWhitespace(req.body?.codeTerms || req.body?.query || '');
+  const maxItems = Math.max(1, Math.min(Number(req.body?.maxItems || 10), 10));
   if (!codeTerms)
     return res.status(400).json({ ok: false, message: 'codeTerms est requis' });
 
   try {
-    // 1. Trouver le code et récupérer son CID
+    // Version stable : on évite /consult/legi/tableMatieres qui remonte des structures trop lourdes.
     const codeList = await callLegifrance('/list/code', {
-      codeName:   codeTerms,
-      pageSize:   3,
+      codeName: codeTerms,
+      pageSize: maxItems,
       pageNumber: 1,
-      states:     ['VIGUEUR'],
-    });
-    const codeEntry = (codeList.results || [])[0];
-    const textId    = codeEntry?.cid || codeEntry?.id || null;
-
-    if (!textId) {
-      return res.status(404).json({ ok: false, message: `Code introuvable: ${codeTerms}` });
-    }
-
-    // 2. Récupérer la table des matières
-    const today = new Date().toISOString().split('T')[0];
-    const outline = await callLegifrance('/consult/legi/tableMatieres', {
-      textId,
-      date:   today,
-      nature: 'CODE',
+      states: ['VIGUEUR'],
     });
 
+    const results = (codeList.results || []).slice(0, maxItems).map(c => ({
+      id: c.id || c.cid || null,
+      cid: c.cid || null,
+      title: c.title || c.titre || c.codeName || null,
+      etat: c.etat || c.state || null,
+      dateDebut: c.dateDebut || c.date || null,
+      lastUpdate: c.lastUpdate || c.dateFin || null,
+      pdf: c.pdf || null,
+    }));
+
+    const best = results[0] || null;
     res.json({
-      ok:      true,
-      mode:    'table_matieres',
-      textId,
-      code:    codeEntry,
-      outline: outline.sections || outline.elements || outline,
-      query_used: { codeTerms, textId, date: today },
+      ok: true,
+      mode: 'code_list_preview',
+      code: best,
+      outline: results,
+      totalResultNumber: codeList.totalResultNumber ?? results.length,
+      returnedCount: results.length,
+      query_used: { codeTerms, maxItems },
+      path_used: '/list/code'
     });
   } catch (err) { handleError(res, err); }
 });
@@ -558,10 +569,26 @@ app.post('/lf/jorf/get', async (req, res) => {
 });
 
 app.post('/lf/consult/last-n-jo', async (req, res) => {
-  const nbElement = Math.min(Number(req.body?.nbElement || 10), 100);
+  const nbElement = Math.max(1, Math.min(Number(req.body?.nbElement || 5), 5));
   try {
-    const result = await callLegifrance('/consult/lastNJo', { nbElement });
-    res.json({ ok: true, path_used: '/consult/lastNJo', result });
+    // Version légère : on réutilise jorfCont puis on ne renvoie qu'un aperçu metadata.
+    const result = await callLegifrance('/consult/jorfCont', {});
+    const items = Array.isArray(result?.results) ? result.results.slice(0, nbElement) : [];
+    const summary = items.map(x => ({
+      id: x.id || x.textCid || null,
+      titre: x.title || x.titre || x.intitule || null,
+      nor: x.nor || null,
+      datePublication: x.datePublication || x.dateTexte || x.date || null,
+      nature: x.nature || x.type || null,
+    }));
+    res.json({
+      ok: true,
+      path_used: '/consult/jorfCont',
+      mode: 'last_jo_preview',
+      nbElement,
+      returnedCount: summary.length,
+      results: summary
+    });
   } catch (err) { handleError(res, err); }
 });
 
@@ -575,6 +602,34 @@ app.post('/lf/consult/get-jo-with-nor', async (req, res) => {
     const payload = isTextCid ? { textCid: nor } : { nor };
     const result  = await callLegifrance(path, payload);
     res.json({ ok: true, path_used: path, result });
+  } catch (err) { handleError(res, err); }
+});
+
+
+// ─── Jurisprudence Légifrance (JURI) ───────────────────────────────────────────
+
+app.post('/lf/juri/get', async (req, res) => {
+  const userQuery = req.body?.query || '';
+  if (!userQuery)
+    return res.status(400).json({ ok: false, message: 'query est requis' });
+
+  const normalized = normalizeSyntaxOnly(userQuery);
+  try {
+    const payload = buildSearchPayload(normalized, {
+      fond: 'JURI',
+      pageSize: req.body?.pageSize || 10,
+      pageNumber: req.body?.pageNumber || 1,
+    });
+    const upstream = await callLegifrance('/search', payload);
+    const results = rerankByIntent('JURISPRUDENCE', upstream.results || []);
+    res.json({
+      ok: true,
+      totalResultNumber: upstream.totalResultNumber ?? results.length,
+      returnedCount: results.length,
+      results,
+      path_used: '/search',
+      routing: { fond_used: 'JURI', endpoint_called: '/lf/juri/get' }
+    });
   } catch (err) { handleError(res, err); }
 });
 
@@ -678,43 +733,68 @@ app.post('/lf/list/conventions', async (req, res) => {
 // /consult/kaliText attend : { id } (id du texte ou d'un élément enfant)
 
 app.post('/lf/consult/kali-text', async (req, res) => {
-  // Accepte un id direct, un idcc, ou une requête textuelle via /list/conventions
-  const id   = normalizeWhitespace(req.body?.id || req.body?.idcc || '');
+  const id = normalizeWhitespace(req.body?.id || req.body?.idcc || '');
   const query = normalizeWhitespace(req.body?.query || '');
 
   if (!id && !query)
     return res.status(400).json({ ok: false, message: 'id, idcc ou query est requis' });
 
   try {
-    let kaliId = id;
+    let upstream;
+    let mode = 'preview_only';
 
-    // Si on n'a pas d'id mais une requête textuelle, résoudre via /list/conventions
-    if (!kaliId && query) {
-      const convList = await callLegifrance('/list/conventions', {
-        titre:      query,
-        pageSize:   3,
-        pageNumber: 1,
+    if (id) {
+      // Fallback stable : on recherche les conventions liées à l'idcc/identifiant au lieu de charger le texte intégral.
+      upstream = await callLegifrance('/list/conventions', {
+        idcc: id,
+        pageSize: 10,
+        pageNumber: 1
       });
-      kaliId = (convList.results || [])[0]?.id || '';
-      if (!kaliId)
-        return res.status(404).json({ ok: false, message: `Convention introuvable: ${query}` });
+      mode = 'idcc_search_fallback';
+    } else {
+      upstream = await callLegifrance('/list/conventions', {
+        titre: query,
+        pageSize: 10,
+        pageNumber: 1
+      });
+      mode = 'query_search_fallback';
     }
 
-    const result = await callLegifrance('/consult/kaliText', { id: kaliId });
-    res.json({ ok: true, path_used: '/consult/kaliText', id: kaliId, result });
+    const results = (upstream.results || []).slice(0, 10);
+    res.json({
+      ok: true,
+      path_used: '/list/conventions',
+      mode,
+      totalResultNumber: upstream.totalResultNumber ?? results.length,
+      returnedCount: results.length,
+      results
+    });
   } catch (err) { handleError(res, err); }
 });
 
 // /consult/kaliContIdcc attend : { id } (id = numéro IDCC ou identifiant)
 
 app.post('/lf/consult/kali-cont-idcc', async (req, res) => {
-  // Le champ API s'appelle "id", pas "idcc"
   const id = normalizeWhitespace(req.body?.idcc || req.body?.id || '');
   if (!id)
     return res.status(400).json({ ok: false, message: 'idcc (ou id) est requis' });
+
   try {
-    const result = await callLegifrance('/consult/kaliContIdcc', { id });
-    res.json({ ok: true, path_used: '/consult/kaliContIdcc', id, result });
+    const upstream = await callLegifrance('/list/conventions', {
+      idcc: id,
+      pageSize: 10,
+      pageNumber: 1
+    });
+    const results = (upstream.results || []).slice(0, 10);
+    res.json({
+      ok: true,
+      path_used: '/list/conventions',
+      mode: 'idcc_search_fallback',
+      idcc: id,
+      totalResultNumber: upstream.totalResultNumber ?? results.length,
+      returnedCount: results.length,
+      results
+    });
   } catch (err) { handleError(res, err); }
 });
 
