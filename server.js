@@ -600,6 +600,27 @@ app.get('/jd/decision', async (req, res) => {
  * Start
  * ========================= */
 
+app.get('/debug/oauth', async (_req, res) => {
+  try {
+    const token = await getPisteToken();
+    res.json({
+      ok: true,
+      hasToken: Boolean(token)
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      message: e.message,
+      status: e.response?.status || null,
+      data: e.response?.data || null
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`proxy-avocat listening on port ${PORT}`);
+});
+
 app.listen(PORT, () => {
   console.log(`proxy-avocat listening on port ${PORT}`);
   console.log(`LEGIFRANCE_BASE_URL=${LEGIFRANCE_BASE_URL}`);
