@@ -769,6 +769,217 @@ app.get('/jd/decision', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// ─── Jurisprudence Légifrance (CETAT / JUFI / CONSTIT) ───────────────────────
+// Distinct de Judilibre : couvre Conseil d'État, Conseil constitutionnel, etc.
+
+app.post('/lf/juri', async (req, res) => {
+  const textId = normalizeWhitespace(req.body?.textId || '');
+  const query  = normalizeSyntaxOnly(req.body?.query || '');
+
+  if (textId) {
+    // Consultation directe par textId connu
+    try {
+      const result = await callLegifrance('/consult/juri', {
+        textId,
+        ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}),
+      });
+      return res.json({ ok: true, mode: 'consult', path_used: '/consult/juri', result });
+    } catch (err) { return handleError(res, err); }
+  }
+
+  if (!query)
+    return res.status(400).json({ ok: false, message: 'textId ou query est requis' });
+
+  // Recherche full-text, fonds JURI / CETAT / CONSTIT détectés automatiquement
+  try {
+    const fond = /\bconseil d[' ]état\b|\bcetat\b|\badministratif\b/i.test(query)
+      ? 'CETAT'
+      : /\bconseil constitu/i.test(query) ? 'CONSTIT' : 'JURI';
+    const payload  = buildSearchPayload(query, { fond, pageSize: req.body?.pageSize || 10 });
+    const upstream = await callLegifrance('/search', payload);
+    res.json({
+      ok: true, mode: 'search', path_used: '/search',
+      totalResultNumber: upstream.totalResultNumber,
+      results: upstream.results || [],
+      routing: { query, fond_used: fond, endpoint_called: '/lf/juri' },
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Consultation d'un code Légifrance (texte consolidé complet) ───────────────
+// /consult/code attend : { textId (LEGITEXT…), date, sctCid? }
+
+app.post('/lf/consult/code', async (req, res) => {
+  const textId   = normalizeWhitespace(req.body?.textId || '');
+  const codeTerms = normalizeWhitespace(req.body?.codeTerms || '');
+  const date      = normalizeWhitespace(req.body?.date || new Date().toISOString().split('T')[0]);
+
+  try {
+    let resolvedTextId = textId;
+
+    // Si on n'a pas de textId, résoudre via /list/code
+    if (!resolvedTextId && codeTerms) {
+      const codeList = await callLegifrance('/list/code', {
+        codeName:   codeTerms,
+        pageSize:   3,
+        pageNumber: 1,
+        states:     ['VIGUEUR'],
+      });
+      resolvedTextId = (codeList.results || [])[0]?.cid || '';
+      if (!resolvedTextId)
+        return res.status(404).json({ ok: false, message: `Code introuvable: ${codeTerms}` });
+    }
+
+    if (!resolvedTextId)
+      return res.status(400).json({ ok: false, message: 'textId ou codeTerms est requis' });
+
+    const result = await callLegifrance('/consult/code', {
+      textId:   resolvedTextId,
+      date,
+      ...(req.body?.sctCid    ? { sctCid:    req.body.sctCid }    : {}),
+      ...(req.body?.abrogated ? { abrogated: req.body.abrogated } : {}),
+    });
+    res.json({ ok: true, path_used: '/consult/code', textId: resolvedTextId, date, result });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Accords d'entreprise (ACCO) ─────────────────────────────────────────────
+
+app.post('/lf/consult/acco', async (req, res) => {
+  const id    = normalizeWhitespace(req.body?.id || '');
+  const query = normalizeSyntaxOnly(req.body?.query || '');
+
+  if (id) {
+    try {
+      const result = await callLegifrance('/consult/acco', { id });
+      return res.json({ ok: true, path_used: '/consult/acco', id, result });
+    } catch (err) { return handleError(res, err); }
+  }
+
+  if (!query)
+    return res.status(400).json({ ok: false, message: 'id ou query est requis' });
+
+  try {
+    const payload  = buildSearchPayload(query, { fond: 'ACCO', pageSize: req.body?.pageSize || 10 });
+    const upstream = await callLegifrance('/search', payload);
+    res.json({
+      ok: true, mode: 'search', path_used: '/search',
+      totalResultNumber: upstream.totalResultNumber,
+      results: upstream.results || [],
+      routing: { query, fond_used: 'ACCO', endpoint_called: '/lf/consult/acco' },
+    });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Historique chronologique d'un texte ─────────────────────────────────────
+
+app.get('/lf/chrono/:textCid', async (req, res) => {
+  const textCid = normalizeWhitespace(req.params?.textCid || '');
+  if (!textCid)
+    return res.status(400).json({ ok: false, message: 'textCid est requis' });
+  try {
+    const result = await callLegifrance(`/chrono/textCid/${encodeURIComponent(textCid)}`, {}, 'GET');
+    res.json({ ok: true, path_used: `/chrono/textCid/${textCid}`, result });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Judilibre – scan (export par lot) ───────────────────────────────────────
+
+app.get('/jd/scan', async (req, res) => {
+  try {
+    const params = {
+      ...(req.query?.type              ? { type:              req.query.type }              : {}),
+      ...(req.query?.chamber           ? { chamber:           req.query.chamber }           : {}),
+      ...(req.query?.jurisdiction      ? { jurisdiction:      req.query.jurisdiction }      : {}),
+      ...(req.query?.solution          ? { solution:          req.query.solution }          : {}),
+      ...(req.query?.publication       ? { publication:       req.query.publication }       : {}),
+      ...(req.query?.date_start        ? { date_start:        req.query.date_start }        : {}),
+      ...(req.query?.date_end          ? { date_end:          req.query.date_end }          : {}),
+      ...(req.query?.date_type         ? { date_type:         req.query.date_type }         : {}),
+      ...(req.query?.order             ? { order:             req.query.order }             : {}),
+      ...(req.query?.batch_size        ? { batch_size:        Number(req.query.batch_size) } : {}),
+      ...(req.query?.search_after      ? { search_after:      req.query.search_after }      : {}),
+      ...(req.query?.resolve_references ? { resolve_references: req.query.resolve_references } : {}),
+      ...(req.query?.abridged          ? { abridged:          req.query.abridged }          : {}),
+      ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
+    };
+    const data = await callJudilibre('/scan', params);
+    res.json({ ok: true, path_used: '/scan', ...data });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Judilibre – export (lot numéroté) ───────────────────────────────────────
+
+app.get('/jd/export', async (req, res) => {
+  try {
+    const params = {
+      ...(req.query?.type         ? { type:         req.query.type }         : {}),
+      ...(req.query?.chamber      ? { chamber:      req.query.chamber }      : {}),
+      ...(req.query?.jurisdiction ? { jurisdiction: req.query.jurisdiction } : {}),
+      ...(req.query?.solution     ? { solution:     req.query.solution }     : {}),
+      ...(req.query?.date_start   ? { date_start:   req.query.date_start }   : {}),
+      ...(req.query?.date_end     ? { date_end:     req.query.date_end }     : {}),
+      ...(req.query?.date_type    ? { date_type:    req.query.date_type }    : {}),
+      ...(req.query?.order        ? { order:        req.query.order }        : {}),
+      ...(req.query?.batch_size   ? { batch_size:   Number(req.query.batch_size) } : {}),
+      ...(req.query?.batch        ? { batch:        Number(req.query.batch) }       : {}),
+      ...(req.query?.resolve_references ? { resolve_references: req.query.resolve_references } : {}),
+      ...(req.query?.abridged     ? { abridged:     req.query.abridged }     : {}),
+    };
+    const data = await callJudilibre('/export', params);
+    res.json({ ok: true, path_used: '/export', ...data });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Judilibre – taxonomie ────────────────────────────────────────────────────
+
+app.get('/jd/taxonomy', async (req, res) => {
+  try {
+    const params = {
+      ...(req.query?.id            ? { id:            req.query.id }            : {}),
+      ...(req.query?.key           ? { key:           req.query.key }           : {}),
+      ...(req.query?.value         ? { value:         req.query.value }         : {}),
+      ...(req.query?.context_value ? { context_value: req.query.context_value } : {}),
+    };
+    const data = await callJudilibre('/taxonomy', params);
+    res.json({ ok: true, path_used: '/taxonomy', ...data });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Judilibre – statistiques ─────────────────────────────────────────────────
+
+app.get('/jd/stats', async (req, res) => {
+  try {
+    const params = {
+      ...(req.query?.jurisdiction      ? { jurisdiction:      req.query.jurisdiction }      : {}),
+      ...(req.query?.location          ? { location:          req.query.location }          : {}),
+      ...(req.query?.date_start        ? { date_start:        req.query.date_start }        : {}),
+      ...(req.query?.date_end          ? { date_end:          req.query.date_end }          : {}),
+      ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
+      ...(req.query?.keys              ? { keys:              req.query.keys }              : {}),
+    };
+    const data = await callJudilibre('/stats', params);
+    res.json({ ok: true, path_used: '/stats', ...data });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Judilibre – historique transactionnel ────────────────────────────────────
+
+app.get('/jd/transactionalhistory', async (req, res) => {
+  const date = normalizeWhitespace(req.query?.date || '');
+  if (!date)
+    return res.status(400).json({ ok: false, message: 'date est requis (YYYY-MM-DD)' });
+  try {
+    const params = {
+      date,
+      ...(req.query?.page_size ? { page_size: Number(req.query.page_size) } : {}),
+      ...(req.query?.from_id   ? { from_id:   req.query.from_id }           : {}),
+    };
+    const data = await callJudilibre('/transactionalhistory', params);
+    res.json({ ok: true, path_used: '/transactionalhistory', ...data });
+  } catch (err) { handleError(res, err); }
+});
+
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
