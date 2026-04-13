@@ -619,10 +619,6 @@ app.get('/debug/oauth', async (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`proxy-avocat listening on port ${PORT}`);
-});
-
-app.listen(PORT, () => {
-  console.log(`proxy-avocat listening on port ${PORT}`);
   console.log(`LEGIFRANCE_BASE_URL=${LEGIFRANCE_BASE_URL}`);
   console.log(`JUDILIBRE_BASE_URL=${JUDILIBRE_BASE_URL}`);
   console.log(`PISTE_OAUTH_URL=${PISTE_OAUTH_URL}`);
