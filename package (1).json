@@ -1,16 +1,14 @@
 {
-  "name": "proxy-avocat-v432",
-  "version": "4.3.2",
+  "name": "proxy-avocat-v433-stable-fix",
+  "version": "4.3.3",
+  "description": "Proxy avocat V4.3.3 with OAuth, safe HTTP status handling, and stable Judilibre routing",
   "main": "server.js",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "axios": "^1.15.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1"
   }
 }
