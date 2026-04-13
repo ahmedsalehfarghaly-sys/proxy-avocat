@@ -1,7 +1,7 @@
 {
-  "name": "proxy-avocat-v432-fixed-package",
-  "version": "4.3.2",
-  "description": "Package prêt à déployer pour le server proxy-avocat v4.3.2 fixed",
+  "name": "proxy-avocat-v434-stable-preview",
+  "version": "4.3.4",
+  "description": "Proxy avocat v4.3.4 – corrections des routes et réponses preview pour éviter les erreurs de volume",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
