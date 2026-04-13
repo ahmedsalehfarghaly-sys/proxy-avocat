@@ -1,0 +1,16 @@
+{
+  "name": "proxy-avocat-v432-fixed-package",
+  "version": "4.3.2",
+  "description": "Package prêt à déployer pour le server proxy-avocat v4.3.2 fixed",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.22.1"
+  }
+}
