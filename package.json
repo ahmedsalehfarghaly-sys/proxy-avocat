@@ -1,0 +1,14 @@
+{
+  "name": "proxy-avocat-v432-oauth-safe",
+  "version": "4.3.2",
+  "description": "Proxy avocat with PISTE OAuth automatic token retrieval for Legifrance and Judilibre",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.15.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1"
+  }
+}
