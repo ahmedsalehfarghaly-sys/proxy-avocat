@@ -1,5 +1,5 @@
 /**
- * proxy-avocat v4.3.2  –  fixed
+ * proxy-avocat v4.3.2  –  complet
  *
  * Prérequis : Node 18+  (fetch natif)
  *
@@ -9,6 +9,7 @@
  *   JD_CLIENT_ID       – client_id PISTE pour Judilibre  (fallback: LF_CLIENT_ID)
  *   JD_CLIENT_SECRET   – client_secret PISTE pour Judilibre (fallback: LF_CLIENT_SECRET)
  *   USE_SANDBOX        – "false" pour basculer sur l'API de production (défaut: sandbox)
+ *   LOG_LEVEL          – "none" | "error" | "info" | "debug"  (défaut: "info")
  *   PORT               – port d'écoute (défaut: 3000)
  */
 
@@ -21,7 +22,24 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'v4.3.4-stable-preview';
+const VERSION = 'v4.3.2-complet';
+
+// ─── Logging ─────────────────────────────────────────────────────────────────
+
+const LEVELS = { none: 0, error: 1, info: 2, debug: 3 };
+const LOG_LEVEL = LEVELS[process.env.LOG_LEVEL] ?? LEVELS.info;
+
+const log = {
+  error: (...a) => LOG_LEVEL >= LEVELS.error && console.error('[ERR]', new Date().toISOString(), ...a),
+  info:  (...a) => LOG_LEVEL >= LEVELS.info  && console.log('[INF]', new Date().toISOString(), ...a),
+  debug: (...a) => LOG_LEVEL >= LEVELS.debug && console.log('[DBG]', new Date().toISOString(), ...a),
+};
+
+// Middleware de logging des requêtes entrantes
+app.use((req, _res, next) => {
+  log.debug(`-> ${req.method} ${req.path}`, req.body || req.query);
+  next();
+});
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -44,23 +62,40 @@ const LF_CLIENT_SECRET = process.env.LF_CLIENT_SECRET || '';
 const JD_CLIENT_ID     = process.env.JD_CLIENT_ID     || LF_CLIENT_ID;
 const JD_CLIENT_SECRET = process.env.JD_CLIENT_SECRET || LF_CLIENT_SECRET;
 
+// ─── Validation des variables d'environnement au démarrage ───────────────────
+
+function validateEnv() {
+  const missing = [];
+  if (!LF_CLIENT_ID)     missing.push('LF_CLIENT_ID');
+  if (!LF_CLIENT_SECRET) missing.push('LF_CLIENT_SECRET');
+  if (missing.length) {
+    log.error('Variables manquantes: ' + missing.join(', ') + '. Toutes les requêtes upstream échoueront.');
+  } else {
+    log.info('Legifrance : ' + LF_BASE);
+    log.info('Judilibre  : ' + JD_BASE);
+    log.info('OAuth      : ' + OAUTH_URL);
+    log.info('Mode       : ' + (USE_SANDBOX ? 'SANDBOX' : 'PRODUCTION'));
+  }
+}
+
 // ─── Token cache ──────────────────────────────────────────────────────────────
 
 const _tokens = {};
 
 async function getToken(clientId, clientSecret) {
-  if (!clientId || !clientSecret) {
-    throw new Error('Identifiants API manquants. Vérifiez LF_CLIENT_ID / LF_CLIENT_SECRET.');
-  }
-  const now = Date.now();
+  if (!clientId || !clientSecret)
+    throw new Error('Identifiants API manquants. Verifiez LF_CLIENT_ID / LF_CLIENT_SECRET.');
+
+  const now    = Date.now();
   const cached = _tokens[clientId];
   if (cached && cached.expiresAt > now + 15_000) return cached.token;
 
+  log.debug('OAuth: renouvellement token');
   const res = await fetch(OAUTH_URL, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type:    'client_credentials',
+    body:    new URLSearchParams({
+      grant_type: 'client_credentials',
       client_id:     clientId,
       client_secret: clientSecret,
       scope:         'openid',
@@ -69,36 +104,71 @@ async function getToken(clientId, clientSecret) {
 
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(`OAuth ${res.status}: ${txt}`);
+    throw new Error('OAuth ' + res.status + ': ' + txt);
   }
   const data = await res.json();
-  _tokens[clientId] = {
-    token:     data.access_token,
-    expiresAt: now + (data.expires_in ?? 3600) * 1000,
-  };
+  _tokens[clientId] = { token: data.access_token, expiresAt: now + (data.expires_in ?? 3600) * 1000 };
+  log.debug('OAuth: token renouvelé, expire dans ' + (data.expires_in ?? 3600) + 's');
   return data.access_token;
+}
+
+// ─── Retry avec backoff exponentiel ──────────────────────────────────────────
+// Réessaie sur 429 (rate-limit) et 503 (service indisponible).
+// Sur 401, invalide le cache et réessaie une fois (token révoqué côté serveur).
+
+const RETRY_STATUSES = new Set([429, 503]);
+const RETRY_DELAYS   = [500, 1500, 4000]; // ms
+
+async function fetchWithRetry(url, options, clientId, clientSecret) {
+  let attempt = 0;
+  while (true) {
+    const res = await fetch(url, options);
+
+    // Token révoqué avant expiration locale
+    if (res.status === 401 && attempt === 0) {
+      log.debug('401 recu, purge du cache token et retry');
+      delete _tokens[clientId];
+      const newToken = await getToken(clientId, clientSecret);
+      options = { ...options, headers: { ...options.headers, Authorization: 'Bearer ' + newToken } };
+      attempt++;
+      continue;
+    }
+
+    if (RETRY_STATUSES.has(res.status) && attempt < RETRY_DELAYS.length) {
+      const retryAfter = Number(res.headers.get('retry-after') || 0) * 1000;
+      const wait = Math.max(RETRY_DELAYS[attempt], retryAfter);
+      log.info(res.status + ' sur ' + url + ' — retry dans ' + wait + 'ms (tentative ' + (attempt + 1) + ')');
+      await new Promise(r => setTimeout(r, wait));
+      attempt++;
+      continue;
+    }
+
+    return res;
+  }
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 async function callLegifrance(path, payload = {}, method = 'POST') {
   const token = await getToken(LF_CLIENT_ID, LF_CLIENT_SECRET);
-  const url   = `${LF_BASE}${path}`;
+  const url   = LF_BASE + path;
 
-  const options = {
+  let options = {
     method,
     headers: {
-      Authorization:  `Bearer ${token}`,
+      Authorization:  'Bearer ' + token,
       'Content-Type': 'application/json',
       Accept:         'application/json',
     },
   };
   if (method !== 'GET') options.body = JSON.stringify(payload);
 
-  const res  = await fetch(url, options);
+  log.debug('LF ' + method + ' ' + path);
+  const res  = await fetchWithRetry(url, options, LF_CLIENT_ID, LF_CLIENT_SECRET);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(`Légifrance ${res.status} ${path}`);
+    log.error('LF ' + res.status + ' ' + path, JSON.stringify(data).slice(0, 200));
+    const err = new Error('Legifrance ' + res.status + ' ' + path);
     err.status   = res.status;
     err.upstream = data;
     throw err;
@@ -113,17 +183,18 @@ async function callJudilibre(path, queryParams = {}) {
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
       .map(([k, v]) => [k, String(v)])
   ).toString();
-  const url = `${JD_BASE}${path}${qs ? '?' + qs : ''}`;
+  const url = JD_BASE + path + (qs ? '?' + qs : '');
 
-  const res  = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept:        'application/json',
-    },
-  });
+  let options = {
+    headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+  };
+
+  log.debug('JD GET ' + path, JSON.stringify(queryParams).slice(0, 100));
+  const res  = await fetchWithRetry(url, options, JD_CLIENT_ID, JD_CLIENT_SECRET);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error(`Judilibre ${res.status} ${path}`);
+    log.error('JD ' + res.status + ' ' + path, JSON.stringify(data).slice(0, 200));
+    const err = new Error('Judilibre ' + res.status + ' ' + path);
     err.status   = res.status;
     err.upstream = data;
     throw err;
@@ -131,22 +202,21 @@ async function callJudilibre(path, queryParams = {}) {
   return data;
 }
 
-// ─── Error helper ─────────────────────────────────────────────────────────────
+// ─── Helpers communs ──────────────────────────────────────────────────────────
 
 function handleError(res, err) {
-  console.error(err.message, err.upstream ?? '');
-  const code = err.status ?? 500;
-  return res.status(code).json({
-    ok:      false,
-    message: err.message,
+  log.error(err.message, err.upstream ? JSON.stringify(err.upstream).slice(0, 200) : '');
+  return res.status(err.status ?? 500).json({
+    ok: false, message: err.message,
     ...(err.upstream ? { upstream: err.upstream } : {}),
   });
 }
 
+const today = () => new Date().toISOString().split('T')[0];
+
 // ─── Normalisation de requête ─────────────────────────────────────────────────
 
-const normalizeWhitespace = v =>
-  String(v || '').replace(/\s+/g, ' ').trim();
+const normalizeWhitespace = v => String(v || '').replace(/\s+/g, ' ').trim();
 
 function dedupeTokens(v) {
   const seen = new Set(), out = [];
@@ -162,12 +232,9 @@ function normalizeSyntaxOnly(v) {
   q = dedupeTokens(q);
   q = q.replace(
     /\b([LRDA]\.?(?:\s)?\d[\w.-]*)\s+(code de la sécurité sociale|css)\b/gi,
-    (_, a) => `article ${a.replace(/\s+/g, '')} code de la sécurité sociale`
+    (_, a) => 'article ' + a.replace(/\s+/g, '') + ' code de la sécurité sociale'
   );
-  q = q.replace(
-    /\b(1240|1241|1231-1)\s+code civil\b/gi,
-    (_, a) => `article ${a} code civil`
-  );
+  q = q.replace(/\b(1240|1241|1231-1)\s+code civil\b/gi, (_, a) => 'article ' + a + ' code civil');
   return normalizeWhitespace(q);
 }
 
@@ -175,43 +242,27 @@ function normalizeSyntaxOnly(v) {
 
 function detectIntent(query) {
   const q = (query || '').toLowerCase();
-  const hasArt =
-    /\barticle\b/.test(q) ||
-    /\b[lrda]\.?(?:\s)?\d[\w.-]*\b/i.test(query || '') ||
-    /\b1240\b|\b1241\b|\b1231-1\b/.test(q);
-
-  if (/\bidcc\b|\bconvention collective\b|\bsyntec\b|\bmétallurgie\b/.test(q))
-    return 'KALI';
-  if (/\bjorftext\b|\bnor\b|\bjournal officiel\b|\bjorf\b|\bdécret\b|\barrêté\b|\bordonnance\b/.test(q))
-    return 'JORF_LODA';
-  if (/\bcour de cassation\b|\bjurisprudence\b|\barrêt\b|\bpourvoi\b|\becli\b/.test(q))
-    return 'JURISPRUDENCE';
+  const hasArt = /\barticle\b/.test(q) || /\b[lrda]\.?(?:\s)?\d[\w.-]*\b/i.test(query || '') || /\b1240\b|\b1241\b|\b1231-1\b/.test(q);
+  if (/\bidcc\b|\bconvention collective\b|\bsyntec\b|\bmétallurgie\b/.test(q))     return 'KALI';
+  if (/\bjorftext\b|\bnor\b|\bjournal officiel\b|\bjorf\b|\bdécret\b|\barrêté\b|\bordonnance\b/.test(q)) return 'JORF_LODA';
+  if (/\bcour de cassation\b|\bjurisprudence\b|\barrêt\b|\bpourvoi\b|\becli\b/.test(q)) return 'JURISPRUDENCE';
   if (hasArt && /\bcode\b/.test(q)) return 'ARTICLE';
-  if (/\bcode civil\b|\bcode de la sécurité sociale\b|\bcode du travail\b|\bcode\b/.test(q))
-    return 'CODE';
+  if (/\bcode civil\b|\bcode de la sécurité sociale\b|\bcode du travail\b|\bcode\b/.test(q)) return 'CODE';
   return 'GENERIC';
 }
 
 const FOND_BY_INTENT = {
-  ARTICLE:      'CODE_ETAT',
-  CODE:         'CODE_ETAT',
-  JURISPRUDENCE:'JURI',
-  JORF_LODA:    'LODA_ETAT',
-  KALI:         'KALI',
-  GENERIC:      'ALL',
+  ARTICLE: 'CODE_ETAT', CODE: 'CODE_ETAT', JURISPRUDENCE: 'JURI',
+  JORF_LODA: 'LODA_ETAT', KALI: 'KALI', GENERIC: 'ALL',
 };
 
 function rerankByIntent(intent, results) {
   const arr = Array.isArray(results) ? [...results] : [];
-  const originOf = r =>
-    String(r.origin || r.type || r.fond || r.nature || r.corpus || '').toUpperCase();
+  const originOf = r => String(r.origin || r.type || r.fond || r.nature || r.corpus || '').toUpperCase();
   const pm = {
-    ARTICLE:      ['LEGI','CODE','JURI','JORF','KALI'],
-    CODE:         ['LEGI','CODE','JURI','JORF','KALI'],
-    JURISPRUDENCE:['JURI','CASSATION','LEGI','JORF','KALI'],
-    JORF_LODA:    ['JORF','LODA','LEGI','JURI','KALI'],
-    KALI:         ['KALI','ACCO','LEGI','JURI','JORF'],
-    GENERIC:      ['LEGI','JURI','JORF','KALI'],
+    ARTICLE: ['LEGI','CODE','JURI','JORF','KALI'], CODE: ['LEGI','CODE','JURI','JORF','KALI'],
+    JURISPRUDENCE: ['JURI','CASSATION','LEGI','JORF','KALI'], JORF_LODA: ['JORF','LODA','LEGI','JURI','KALI'],
+    KALI: ['KALI','ACCO','LEGI','JURI','JORF'], GENERIC: ['LEGI','JURI','JORF','KALI'],
   };
   const p = pm[intent] || pm.GENERIC;
   return arr.sort((a, b) => {
@@ -221,753 +272,515 @@ function rerankByIntent(intent, results) {
   });
 }
 
-// ─── Constructeur de SearchRequestDTO ─────────────────────────────────────────
-// Le corps de /search est un objet complexe avec fond + recherche imbriquée.
+// ─── Rerankage spécifique contentieux ────────────────────────────────────────
+// Hiérarchie fixe : TEXTE → JUGE → ADMINISTRATION → PROCÉDURE
+
+const CONTENTIEUX_LAYERS = {
+  TEXTE:         ['LEGI','CODE','LEGIARTI','LEGITEXT'],
+  JUGE:          ['JURI','JUFI','CETAT','CONSTIT','CASSATION'],
+  ADMINISTRATION:['JORF','LODA','CIRC','DOSSIER'],
+  PROCEDURE:     ['KALI','ACCO','CNIL'],
+};
+
+function detectContentieuxLayer(result) {
+  const src = String(
+    result.origin || result.type || result.fond ||
+    result.nature || result.corpus || result.id || ''
+  ).toUpperCase();
+  for (const [layer, markers] of Object.entries(CONTENTIEUX_LAYERS)) {
+    if (markers.some(m => src.includes(m))) return layer;
+  }
+  return 'AUTRE';
+}
+
+const LAYER_ORDER = ['TEXTE','JUGE','ADMINISTRATION','PROCEDURE','AUTRE'];
+
+function rerankContentieux(results) {
+  const arr = Array.isArray(results) ? [...results] : [];
+  return arr.sort((a, b) => {
+    const la = LAYER_ORDER.indexOf(detectContentieuxLayer(a));
+    const lb = LAYER_ORDER.indexOf(detectContentieuxLayer(b));
+    return la - lb;
+  });
+}
+
+// ─── Constructeur SearchRequestDTO ───────────────────────────────────────────
 
 function buildSearchPayload(query, { fond, pageSize = 10, pageNumber = 1 } = {}) {
   const intent = detectIntent(normalizeSyntaxOnly(query));
   return {
     fond: fond || FOND_BY_INTENT[intent] || 'ALL',
     recherche: {
-      champs: [{
-        typeChamp: 'ALL',
-        criteres: [{
-          typeRecherche: 'TOUS_LES_MOTS_DANS_UN_CHAMP',
-          valeur:        query,
-          operateur:     'ET',
-        }],
-        operateur: 'ET',
-      }],
-      operateur:      'ET',
-      typePagination: 'DEFAUT',
-      pageSize:        Math.min(Number(pageSize) || 10, 100),
-      pageNumber:      Number(pageNumber) || 1,
-      sort:           'PERTINENCE',
+      champs: [{ typeChamp: 'ALL', criteres: [{ typeRecherche: 'TOUS_LES_MOTS_DANS_UN_CHAMP', valeur: query, operateur: 'ET' }], operateur: 'ET' }],
+      operateur: 'ET', typePagination: 'DEFAUT',
+      pageSize:   Math.min(Number(pageSize) || 10, 100),
+      pageNumber: Number(pageNumber) || 1,
+      sort: 'PERTINENCE',
     },
   };
 }
 
-// ─── Routes utilitaires ───────────────────────────────────────────────────────
+// Résout un code par nom -> textId (LEGITEXT)
+async function resolveCodeId(codeTerms) {
+  const list = await callLegifrance('/list/code', { codeName: codeTerms, pageSize: 3, pageNumber: 1, states: ['VIGUEUR'] });
+  return (list.results || [])[0]?.cid || (list.results || [])[0]?.id || null;
+}
+
+// Résout une convention par query -> id KALI
+async function resolveKaliId(query) {
+  const list = await callLegifrance('/list/conventions', { titre: query, pageSize: 3, pageNumber: 1 });
+  return (list.results || [])[0]?.id || null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Santé ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) =>
   res.json({ ok: true, service: 'proxy-avocat', version: VERSION, sandbox: USE_SANDBOX })
 );
 
 app.get('/lf/commit', async (_req, res) => {
-  try {
-    const data = await callLegifrance('/misc/commitId', {}, 'GET');
-    res.json({ ok: true, path_used: '/misc/commitId', ...data });
-  } catch (err) { handleError(res, err); }
+  try { res.json({ ok: true, path_used: '/misc/commitId', ...await callLegifrance('/misc/commitId', {}, 'GET') }); }
+  catch (err) { handleError(res, err); }
 });
 
 app.get('/jd/healthcheck', async (_req, res) => {
-  try {
-    const data = await callJudilibre('/healthcheck');
-    res.json({ ok: true, path_used: '/healthcheck', ...data });
-  } catch (err) { handleError(res, err); }
+  try { res.json({ ok: true, path_used: '/healthcheck', ...await callJudilibre('/healthcheck') }); }
+  catch (err) { handleError(res, err); }
 });
 
-// ─── Route générique (escape hatch) ──────────────────────────────────────────
+// ─── Escape hatch ─────────────────────────────────────────────────────────────
 
 app.post('/raw/request', async (req, res) => {
   const { api, method = 'POST', path, payload = {} } = req.body || {};
-  if (!api || !path)
-    return res.status(400).json({ ok: false, message: 'api et path sont requis' });
-
+  if (!api || !path) return res.status(400).json({ ok: false, message: 'api et path sont requis' });
   try {
-    if (api === 'legifrance') {
-      const data = await callLegifrance(path, payload, method.toUpperCase());
-      return res.json({ ok: true, api_used: 'legifrance', path_used: path, ...data });
-    }
-    if (api === 'judilibre') {
-      const data = await callJudilibre(path, payload);
-      return res.json({ ok: true, api_used: 'judilibre', path_used: path, ...data });
-    }
-    return res.status(400).json({ ok: false, message: `api non supportée: ${api}` });
+    if (api === 'legifrance') return res.json({ ok: true, api_used: 'legifrance', path_used: path, ...await callLegifrance(path, payload, method.toUpperCase()) });
+    if (api === 'judilibre')  return res.json({ ok: true, api_used: 'judilibre',  path_used: path, ...await callJudilibre(path, payload) });
+    return res.status(400).json({ ok: false, message: 'api non supportee: ' + api });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── Recherche Légifrance ─────────────────────────────────────────────────────
+// ─── Recherche ────────────────────────────────────────────────────────────────
 
 app.post('/lf/search-simple', async (req, res) => {
   const userQuery = req.body?.query || req.body?.terms || '';
-  if (!userQuery)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
-
+  if (!userQuery) return res.status(400).json({ ok: false, message: 'query est requis' });
   const normalized = normalizeSyntaxOnly(userQuery);
   const intent     = detectIntent(normalized);
-
   try {
-    const payload = buildSearchPayload(normalized, {
-      pageSize:   req.body?.pageSize,
-      pageNumber: req.body?.pageNumber,
-    });
+    const payload  = buildSearchPayload(normalized, { pageSize: req.body?.pageSize, pageNumber: req.body?.pageNumber });
     const upstream = await callLegifrance('/search', payload);
-    const results  = rerankByIntent(intent, upstream.results || []);
-    res.json({
-      ok: true,
-      returnedCount:     results.length,
-      totalResultNumber: upstream.totalResultNumber ?? results.length,
-      results,
-      routing: { user_query: userQuery, normalized_query: normalized, intent,
-                 fond_used: payload.fond, endpoint_called: '/lf/search-simple' },
-    });
+    const ranked   = rerankByIntent(intent, upstream.results || []);
+    const results  = rerankContentieux(ranked);
+    res.json({ ok: true, returnedCount: results.length, totalResultNumber: upstream.totalResultNumber ?? results.length, results,
+      routing: { user_query: userQuery, normalized_query: normalized, intent, fond_used: payload.fond, contentieux_layer: results[0] ? detectContentieuxLayer(results[0]) : null, endpoint_called: '/lf/search-simple' } });
   } catch (err) { handleError(res, err); }
 });
 
 app.post('/lf/search-structured-safe', async (req, res) => {
   const userQuery = req.body?.query || req.body?.terms || '';
-  if (!userQuery)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
-
+  if (!userQuery) return res.status(400).json({ ok: false, message: 'query est requis' });
   const normalized = normalizeSyntaxOnly(userQuery);
   const intent     = detectIntent(normalized);
-
   try {
-    // Payload minimal et stable : on évite les structures trop agressives qui génèrent des 400 upstream.
-    const payload = buildSearchPayload(normalized, {
-      fond:       req.body?.fond,
-      pageSize:   req.body?.pageSize,
-      pageNumber: req.body?.pageNumber,
-    });
-
+    const payload  = buildSearchPayload(normalized, { fond: req.body?.fond, pageSize: req.body?.pageSize, pageNumber: req.body?.pageNumber });
     const upstream = await callLegifrance('/search', payload);
-    const results  = rerankByIntent(intent, upstream.results || []);
-    res.json({
-      ok: true,
-      returnedCount:     results.length,
-      totalResultNumber: upstream.totalResultNumber ?? results.length,
-      results,
-      routing: {
-        user_query: userQuery,
-        normalized_query: normalized,
-        intent,
-        fond_used: payload.fond,
-        endpoint_called: '/lf/search-structured-safe',
-        mode: 'safe_minimal_payload'
-      },
-    });
-  } catch (err) {
-    // Fallback : si /search refuse encore, on renvoie une erreur propre et non un 400 opaque.
-    handleError(res, err);
-  }
-});
-
-// ─── Suggestions Légifrance ───────────────────────────────────────────────────
-// /suggest attend : { searchText, supplies, documentsDits }
-
-app.post('/lf/suggest', async (req, res) => {
-  const userQuery = req.body?.query || req.body?.searchText || '';
-  if (!userQuery)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
-
-  const normalized = normalizeSyntaxOnly(userQuery);
-  const intent     = detectIntent(normalized);
-
-  try {
-    const payload = {
-      searchText:   normalized,
-      supplies:     req.body?.supplies || [FOND_BY_INTENT[intent] || 'ALL'],
-      documentsDits: req.body?.documentsDits ?? false,
-    };
-    const upstream = await callLegifrance('/suggest', payload);
-    const results  = rerankByIntent(intent, upstream.results || []);
-    res.json({
-      ok: true,
-      returnedCount:     results.length,
-      totalResultNumber: upstream.totalResultNumber ?? results.length,
-      results,
-      routing: { user_query: userQuery, normalized_query: normalized, intent,
-                 endpoint_called: '/lf/suggest' },
-    });
+    const ranked   = rerankByIntent(intent, upstream.results || []);
+    const results  = rerankContentieux(ranked);
+    res.json({ ok: true, returnedCount: results.length, totalResultNumber: upstream.totalResultNumber ?? results.length, results,
+      routing: { user_query: userQuery, normalized_query: normalized, intent, fond_used: payload.fond, contentieux_layer: results[0] ? detectContentieuxLayer(results[0]) : null, endpoint_called: '/lf/search-structured-safe' } });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── Résolution d'article ─────────────────────────────────────────────────────
+// ─── Suggestions ──────────────────────────────────────────────────────────────
+
+// /suggest attend { searchText, supplies, documentsDits }
+app.post('/lf/suggest', async (req, res) => {
+  const userQuery = req.body?.query || req.body?.searchText || '';
+  if (!userQuery) return res.status(400).json({ ok: false, message: 'query est requis' });
+  const normalized = normalizeSyntaxOnly(userQuery);
+  const intent     = detectIntent(normalized);
+  try {
+    const payload = { searchText: normalized, supplies: req.body?.supplies || [FOND_BY_INTENT[intent] || 'ALL'], documentsDits: req.body?.documentsDits ?? false };
+    const upstream = await callLegifrance('/suggest', payload);
+    const results  = rerankByIntent(intent, upstream.results || []);
+    res.json({ ok: true, returnedCount: results.length, totalResultNumber: upstream.totalResultNumber ?? results.length, results,
+      routing: { user_query: userQuery, normalized_query: normalized, intent, endpoint_called: '/lf/suggest' } });
+  } catch (err) { handleError(res, err); }
+});
+
+// /suggest/acco attend { searchText }
+app.post('/lf/suggest/acco', async (req, res) => {
+  const searchText = normalizeWhitespace(req.body?.query || req.body?.searchText || '');
+  if (!searchText) return res.status(400).json({ ok: false, message: 'query est requis' });
+  try { res.json({ ok: true, path_used: '/suggest/acco', ...await callLegifrance('/suggest/acco', { searchText }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+// /suggest/pdc attend { searchText, origin?, fond? }
+app.post('/lf/suggest/pdc', async (req, res) => {
+  const searchText = normalizeWhitespace(req.body?.query || req.body?.searchText || '');
+  if (!searchText) return res.status(400).json({ ok: false, message: 'query est requis' });
+  try {
+    const payload = { searchText, ...(req.body?.origin ? { origin: req.body.origin } : {}), ...(req.body?.fond ? { fond: req.body.fond } : {}) };
+    res.json({ ok: true, path_used: '/suggest/pdc', ...await callLegifrance('/suggest/pdc', payload) });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Articles ─────────────────────────────────────────────────────────────────
 
 app.post('/lf/article-resolve', async (req, res) => {
   const articleNumber = normalizeWhitespace(req.body?.articleNumber || '');
   const codeTerms     = normalizeWhitespace(req.body?.codeTerms || '');
-  const userQuery     = normalizeWhitespace(
-    req.body?.query ||
-    `${articleNumber ? `article ${articleNumber}` : ''} ${codeTerms}`.trim()
-  );
-  if (!userQuery)
-    return res.status(400).json({ ok: false, message: 'articleNumber+codeTerms ou query est requis' });
-
+  const userQuery     = normalizeWhitespace(req.body?.query || ((articleNumber ? 'article ' + articleNumber : '') + ' ' + codeTerms).trim());
+  if (!userQuery) return res.status(400).json({ ok: false, message: 'articleNumber+codeTerms ou query est requis' });
   const normalized = normalizeSyntaxOnly(userQuery);
   try {
-    const payload = buildSearchPayload(normalized, { fond: 'CODE_ETAT', pageSize: 5 });
-    const upstream = await callLegifrance('/search', payload);
+    const upstream = await callLegifrance('/search', buildSearchPayload(normalized, { fond: 'CODE_ETAT', pageSize: 5 }));
     const best = (upstream.results || [])[0] || null;
-    res.json({
-      ok: true,
-      returnedCount: best ? 1 : 0,
-      bestMatch:     best,
-      query:         normalized,
-      routing: { user_query: userQuery, normalized_query: normalized,
-                 intent: 'ARTICLE', endpoint_called: '/lf/article-resolve' },
-    });
+    res.json({ ok: true, returnedCount: best ? 1 : 0, bestMatch: best, query: normalized,
+      routing: { user_query: userQuery, normalized_query: normalized, intent: 'ARTICLE', endpoint_called: '/lf/article-resolve' } });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── Récupération d'article (contenu complet) ─────────────────────────────────
-// Stratégie :
-//   1. Chercher le code via /list/code pour obtenir son LEGITEXT
-//   2. Appeler /consult/getArticleWithIdAndNum avec le LEGITEXT + numéro article
-//   3. Fallback /consult/getArticleByCid si l'article a un cid connu
-
+// Stratégie en 3 étapes : getArticleWithIdAndNum -> search+getArticle -> search_only
 app.post('/lf/article-fetch', async (req, res) => {
   const articleNumber = normalizeWhitespace(req.body?.articleNumber || '');
   const codeTerms     = normalizeWhitespace(req.body?.codeTerms || '');
   if (!articleNumber || !codeTerms)
     return res.status(400).json({ ok: false, message: 'articleNumber et codeTerms sont requis' });
-
   try {
-    // Étape 1 : trouver le LEGITEXT du code
-    const codeList = await callLegifrance('/list/code', {
-      codeName:   codeTerms,
-      pageSize:   5,
-      pageNumber: 1,
-    });
-    const codeEntry = (codeList.results || [])[0];
-    const textId    = codeEntry?.cid || codeEntry?.id || null;
-
-    // Étape 2 : consulter l'article par LEGITEXT + numéro
+    const textId = await resolveCodeId(codeTerms);
     if (textId) {
       try {
-        const article = await callLegifrance('/consult/getArticleWithIdAndNum', {
-          id:  textId,
-          num: articleNumber,
-        });
-        return res.json({
-          ok:        true,
-          mode:      'consult_by_id_and_num',
-          path_used: '/consult/getArticleWithIdAndNum',
-          textId,
-          article,
-          query:     `article ${articleNumber} ${codeTerms}`,
-        });
-      } catch { /* continue fallback */ }
+        const article = await callLegifrance('/consult/getArticleWithIdAndNum', { id: textId, num: articleNumber });
+        return res.json({ ok: true, mode: 'consult_by_id_and_num', path_used: '/consult/getArticleWithIdAndNum', textId, article, query: 'article ' + articleNumber + ' ' + codeTerms });
+      } catch { /* fallback */ }
     }
-
-    // Étape 3 : fallback recherche plein-texte
-    const searchPayload = buildSearchPayload(
-      `article ${articleNumber} ${codeTerms}`, { fond: 'CODE_ETAT', pageSize: 3 }
-    );
-    const searchResult = await callLegifrance('/search', searchPayload);
-    const best = (searchResult.results || [])[0] || null;
-
-    // Étape 4 : si on a un id LEGIARTI, récupérer le texte complet
+    const sr   = await callLegifrance('/search', buildSearchPayload('article ' + articleNumber + ' ' + codeTerms, { fond: 'CODE_ETAT', pageSize: 3 }));
+    const best = (sr.results || [])[0] || null;
     if (best?.id && /^LEGIARTI/i.test(best.id)) {
       const full = await callLegifrance('/consult/getArticle', { id: best.id });
-      return res.json({
-        ok:        true,
-        mode:      'consult_by_legiarti',
-        path_used: '/consult/getArticle',
-        article:   full,
-        query:     `article ${articleNumber} ${codeTerms}`,
-      });
+      return res.json({ ok: true, mode: 'consult_by_legiarti', path_used: '/consult/getArticle', article: full, query: 'article ' + articleNumber + ' ' + codeTerms });
     }
-
-    res.json({
-      ok:        true,
-      mode:      'search_only',
-      path_used: '/search',
-      bestMatch: best,
-      query:     `article ${articleNumber} ${codeTerms}`,
-    });
+    res.json({ ok: true, mode: 'search_only', path_used: '/search', bestMatch: best, query: 'article ' + articleNumber + ' ' + codeTerms });
   } catch (err) { handleError(res, err); }
+});
+
+// Article par CID chronologique
+app.post('/lf/consult/article-by-cid', async (req, res) => {
+  const cid = normalizeWhitespace(req.body?.cid || '');
+  if (!cid) return res.status(400).json({ ok: false, message: 'cid est requis' });
+  try { res.json({ ok: true, path_used: '/consult/getArticleByCid', cid, ...await callLegifrance('/consult/getArticleByCid', { cid }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+// Article par ELI ou alias
+app.post('/lf/consult/article-by-eli', async (req, res) => {
+  const idEliOrAlias = normalizeWhitespace(req.body?.idEliOrAlias || req.body?.eli || '');
+  if (!idEliOrAlias) return res.status(400).json({ ok: false, message: 'idEliOrAlias est requis' });
+  try { res.json({ ok: true, path_used: '/consult/getArticleWithIdEliOrAlias', idEliOrAlias, ...await callLegifrance('/consult/getArticleWithIdEliOrAlias', { idEliOrAlias }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+// Articles de même numéro dans d'autres textes
+app.post('/lf/consult/same-num-article', async (req, res) => {
+  const { articleCid, articleNum, textCid, date } = req.body || {};
+  if (!articleCid || !articleNum || !textCid)
+    return res.status(400).json({ ok: false, message: 'articleCid, articleNum et textCid sont requis' });
+  try { res.json({ ok: true, path_used: '/consult/sameNumArticle', ...await callLegifrance('/consult/sameNumArticle', { articleCid, articleNum, textCid, date: normalizeWhitespace(date || today()) }) }); }
+  catch (err) { handleError(res, err); }
 });
 
 // ─── Codes ────────────────────────────────────────────────────────────────────
-// /list/code attend : { codeName, pageSize, pageNumber, states }
 
 app.post('/lf/code-safe', async (req, res) => {
   const codeTerms = normalizeWhitespace(req.body?.codeTerms || req.body?.query || '');
-  if (!codeTerms)
-    return res.status(400).json({ ok: false, message: 'codeTerms est requis' });
-
+  if (!codeTerms) return res.status(400).json({ ok: false, message: 'codeTerms est requis' });
   try {
-    const upstream = await callLegifrance('/list/code', {
-      codeName:   codeTerms,
-      pageSize:   Math.min(Number(req.body?.maxItems || 5), 100),
-      pageNumber: 1,
-      states:     ['VIGUEUR'],
-    });
-    res.json({
-      ok:   true,
-      mode: 'code_lookup',
-      code: (upstream.results || [])[0] || null,
-      searchSummary: {
-        totalResultNumber: upstream.totalResultNumber ?? (upstream.results || []).length,
-        returnedCount:     (upstream.results || []).length,
-      },
-      query_used: { codeName: codeTerms },
-    });
+    const upstream = await callLegifrance('/list/code', { codeName: codeTerms, pageSize: Math.min(Number(req.body?.maxItems || 5), 100), pageNumber: 1, states: ['VIGUEUR'] });
+    res.json({ ok: true, mode: 'code_lookup', code: (upstream.results || [])[0] || null,
+      searchSummary: { totalResultNumber: upstream.totalResultNumber ?? (upstream.results||[]).length, returnedCount: (upstream.results||[]).length }, query_used: { codeName: codeTerms } });
   } catch (err) { handleError(res, err); }
 });
-
-// /consult/legi/tableMatieres attend : { textId, date, nature, sctCid }
-// On résout d'abord le code pour obtenir son textId (CID).
 
 app.post('/lf/code-resolve', async (req, res) => {
   const codeTerms = normalizeWhitespace(req.body?.codeTerms || req.body?.query || '');
-  const maxItems = Math.max(1, Math.min(Number(req.body?.maxItems || 10), 10));
-  if (!codeTerms)
-    return res.status(400).json({ ok: false, message: 'codeTerms est requis' });
-
+  if (!codeTerms) return res.status(400).json({ ok: false, message: 'codeTerms est requis' });
   try {
-    // Version stable : on évite /consult/legi/tableMatieres qui remonte des structures trop lourdes.
-    const codeList = await callLegifrance('/list/code', {
-      codeName: codeTerms,
-      pageSize: maxItems,
-      pageNumber: 1,
-      states: ['VIGUEUR'],
-    });
-
-    const results = (codeList.results || []).slice(0, maxItems).map(c => ({
-      id: c.id || c.cid || null,
-      cid: c.cid || null,
-      title: c.title || c.titre || c.codeName || null,
-      etat: c.etat || c.state || null,
-      dateDebut: c.dateDebut || c.date || null,
-      lastUpdate: c.lastUpdate || c.dateFin || null,
-      pdf: c.pdf || null,
-    }));
-
-    const best = results[0] || null;
-    res.json({
-      ok: true,
-      mode: 'code_list_preview',
-      code: best,
-      outline: results,
-      totalResultNumber: codeList.totalResultNumber ?? results.length,
-      returnedCount: results.length,
-      query_used: { codeTerms, maxItems },
-      path_used: '/list/code'
-    });
+    const codeList  = await callLegifrance('/list/code', { codeName: codeTerms, pageSize: 3, pageNumber: 1, states: ['VIGUEUR'] });
+    const codeEntry = (codeList.results || [])[0];
+    const textId    = codeEntry?.cid || codeEntry?.id || null;
+    if (!textId) return res.status(404).json({ ok: false, message: 'Code introuvable: ' + codeTerms });
+    const outline = await callLegifrance('/consult/legi/tableMatieres', { textId, date: today(), nature: 'CODE' });
+    res.json({ ok: true, mode: 'table_matieres', textId, code: codeEntry, outline: outline.sections || outline.elements || outline, query_used: { codeTerms, textId, date: today() } });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── JORF ─────────────────────────────────────────────────────────────────────
+// Texte consolidé complet – /consult/code attend { textId, date, sctCid? }
+app.post('/lf/consult/code', async (req, res) => {
+  const textId    = normalizeWhitespace(req.body?.textId || '');
+  const codeTerms = normalizeWhitespace(req.body?.codeTerms || '');
+  const date      = normalizeWhitespace(req.body?.date || today());
+  try {
+    const resolvedId = textId || (codeTerms ? await resolveCodeId(codeTerms) : null);
+    if (!resolvedId) return res.status(400).json({ ok: false, message: 'textId ou codeTerms est requis' });
+    const result = await callLegifrance('/consult/code', { textId: resolvedId, date, ...(req.body?.sctCid ? { sctCid: req.body.sctCid } : {}), ...(req.body?.abrogated ? { abrogated: req.body.abrogated } : {}) });
+    res.json({ ok: true, path_used: '/consult/code', textId: resolvedId, date, result });
+  } catch (err) { handleError(res, err); }
+});
+
+// Partie d'un texte LEGI (sections) – /consult/legiPart attend { textId, date }
+app.post('/lf/consult/legi-part', async (req, res) => {
+  const textId    = normalizeWhitespace(req.body?.textId || '');
+  const codeTerms = normalizeWhitespace(req.body?.codeTerms || '');
+  const date      = normalizeWhitespace(req.body?.date || today());
+  try {
+    const resolvedId = textId || (codeTerms ? await resolveCodeId(codeTerms) : null);
+    if (!resolvedId) return res.status(400).json({ ok: false, message: 'textId ou codeTerms est requis' });
+    const result = await callLegifrance('/consult/legiPart', { textId: resolvedId, date, ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}) });
+    res.json({ ok: true, path_used: '/consult/legiPart', textId: resolvedId, date, result });
+  } catch (err) { handleError(res, err); }
+});
+
+// Versions canoniques / proches
+app.post('/lf/search/canonical-version', async (req, res) => {
+  const { textId, date } = req.body || {};
+  if (!textId) return res.status(400).json({ ok: false, message: 'textId est requis' });
+  try { res.json({ ok: true, path_used: '/search/canonicalVersion', ...await callLegifrance('/search/canonicalVersion', { textId, date: normalizeWhitespace(date || today()) }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+app.post('/lf/search/canonical-article', async (req, res) => {
+  const { articleId, date } = req.body || {};
+  if (!articleId) return res.status(400).json({ ok: false, message: 'articleId est requis' });
+  try { res.json({ ok: true, path_used: '/search/canonicalArticleVersion', ...await callLegifrance('/search/canonicalArticleVersion', { articleId, date: normalizeWhitespace(date || today()) }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+app.post('/lf/search/nearest-version', async (req, res) => {
+  const { textId, date } = req.body || {};
+  if (!textId) return res.status(400).json({ ok: false, message: 'textId est requis' });
+  try { res.json({ ok: true, path_used: '/search/nearestVersion', ...await callLegifrance('/search/nearestVersion', { textId, date: normalizeWhitespace(date || today()) }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+// ─── JORF & LODA ─────────────────────────────────────────────────────────────
 
 app.post('/lf/jorf/get', async (req, res) => {
   const nor = normalizeWhitespace(req.body?.nor || '');
   try {
     if (nor) {
       const isTextCid = /^JORFTEXT/i.test(nor);
-      const path    = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
-      const payload = isTextCid ? { textCid: nor } : { nor };
-      const result  = await callLegifrance(path, payload);
-      return res.json({ ok: true, mode: 'targeted_jorf', path_used: path, result });
+      const path = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
+      return res.json({ ok: true, mode: 'targeted_jorf', path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) });
     }
-    // Sans NOR : retourner les derniers JO
-    const result = await callLegifrance('/consult/lastNJo', { nbElement: 5 });
-    res.json({ ok: true, mode: 'last_jo', path_used: '/consult/lastNJo', result });
+    res.json({ ok: true, mode: 'last_jo', path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: 5 }) });
   } catch (err) { handleError(res, err); }
 });
 
 app.post('/lf/consult/last-n-jo', async (req, res) => {
-  const nbElement = Math.max(1, Math.min(Number(req.body?.nbElement || 5), 5));
-  try {
-    // Version légère : on réutilise jorfCont puis on ne renvoie qu'un aperçu metadata.
-    const result = await callLegifrance('/consult/jorfCont', {});
-    const items = Array.isArray(result?.results) ? result.results.slice(0, nbElement) : [];
-    const summary = items.map(x => ({
-      id: x.id || x.textCid || null,
-      titre: x.title || x.titre || x.intitule || null,
-      nor: x.nor || null,
-      datePublication: x.datePublication || x.dateTexte || x.date || null,
-      nature: x.nature || x.type || null,
-    }));
-    res.json({
-      ok: true,
-      path_used: '/consult/jorfCont',
-      mode: 'last_jo_preview',
-      nbElement,
-      returnedCount: summary.length,
-      results: summary
-    });
-  } catch (err) { handleError(res, err); }
+  try { res.json({ ok: true, path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: Math.min(Number(req.body?.nbElement || 10), 100) }) }); }
+  catch (err) { handleError(res, err); }
 });
 
 app.post('/lf/consult/get-jo-with-nor', async (req, res) => {
   const nor = normalizeWhitespace(req.body?.nor || '');
-  if (!nor)
-    return res.status(400).json({ ok: false, message: 'nor est requis' });
+  if (!nor) return res.status(400).json({ ok: false, message: 'nor est requis' });
   try {
     const isTextCid = /^JORFTEXT/i.test(nor);
-    const path    = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
-    const payload = isTextCid ? { textCid: nor } : { nor };
-    const result  = await callLegifrance(path, payload);
-    res.json({ ok: true, path_used: path, result });
+    const path = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
+    res.json({ ok: true, path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) });
   } catch (err) { handleError(res, err); }
 });
-
-
-// ─── Jurisprudence Légifrance (JURI) ───────────────────────────────────────────
-
-app.post('/lf/juri/get', async (req, res) => {
-  const userQuery = req.body?.query || '';
-  if (!userQuery)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
-
-  const normalized = normalizeSyntaxOnly(userQuery);
-  try {
-    const payload = buildSearchPayload(normalized, {
-      fond: 'JURI',
-      pageSize: req.body?.pageSize || 10,
-      pageNumber: req.body?.pageNumber || 1,
-    });
-    const upstream = await callLegifrance('/search', payload);
-    const results = rerankByIntent('JURISPRUDENCE', upstream.results || []);
-    res.json({
-      ok: true,
-      totalResultNumber: upstream.totalResultNumber ?? results.length,
-      returnedCount: results.length,
-      results,
-      path_used: '/search',
-      routing: { fond_used: 'JURI', endpoint_called: '/lf/juri/get' }
-    });
-  } catch (err) { handleError(res, err); }
-});
-
-// ─── Lois & Décrets (LODA) ────────────────────────────────────────────────────
 
 app.post('/lf/law-decree/get', async (req, res) => {
   const query = normalizeSyntaxOnly(req.body?.query || '');
-  if (!query)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
+  if (!query) return res.status(400).json({ ok: false, message: 'query est requis' });
   try {
-    const payload = buildSearchPayload(query, {
-      fond:       'LODA_ETAT',   // LODA_ETAT = textes en vigueur
-      pageSize:   req.body?.pageSize || 10,
-      pageNumber: req.body?.pageNumber || 1,
-    });
+    const payload  = buildSearchPayload(query, { fond: 'LODA_ETAT', pageSize: req.body?.pageSize || 10, pageNumber: req.body?.pageNumber || 1 });
     const upstream = await callLegifrance('/search', payload);
-    res.json({
-      ok:                true,
-      path_used:         '/search',
-      totalResultNumber: upstream.totalResultNumber,
-      results:           upstream.results || [],
-      routing: { user_query: req.body.query, normalized_query: query,
-                 fond_used: 'LODA_ETAT', intent: 'JORF_LODA',
-                 endpoint_called: '/lf/law-decree/get' },
-    });
+    res.json({ ok: true, path_used: '/search', totalResultNumber: upstream.totalResultNumber, results: upstream.results || [],
+      routing: { user_query: req.body.query, normalized_query: query, fond_used: 'LODA_ETAT', intent: 'JORF_LODA', endpoint_called: '/lf/law-decree/get' } });
   } catch (err) { handleError(res, err); }
 });
-
-// ─── Circulaires ──────────────────────────────────────────────────────────────
 
 app.post('/lf/circulaire/get', async (req, res) => {
   const query = normalizeSyntaxOnly(req.body?.query || '');
-  if (!query)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
+  if (!query) return res.status(400).json({ ok: false, message: 'query est requis' });
   try {
-    const payload = buildSearchPayload(query, {
-      fond:       'CIRC',
-      pageSize:   req.body?.pageSize || 10,
-      pageNumber: req.body?.pageNumber || 1,
-    });
+    const payload  = buildSearchPayload(query, { fond: 'CIRC', pageSize: req.body?.pageSize || 10, pageNumber: req.body?.pageNumber || 1 });
     const upstream = await callLegifrance('/search', payload);
-    res.json({
-      ok:                true,
-      path_used:         '/search',
-      totalResultNumber: upstream.totalResultNumber,
-      results:           upstream.results || [],
-      routing: { user_query: req.body.query, normalized_query: query,
-                 fond_used: 'CIRC', intent: 'JORF_LODA',
-                 endpoint_called: '/lf/circulaire/get' },
-    });
+    res.json({ ok: true, path_used: '/search', totalResultNumber: upstream.totalResultNumber, results: upstream.results || [],
+      routing: { user_query: req.body.query, normalized_query: query, fond_used: 'CIRC', intent: 'JORF_LODA', endpoint_called: '/lf/circulaire/get' } });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── LODA liste ───────────────────────────────────────────────────────────────
-// /list/loda attend : { pageSize, pageNumber, natures, legalStatus, sort, ... }
-
 app.post('/lf/list/loda', async (req, res) => {
   try {
-    const payload = {
-      pageSize:   Math.min(Number(req.body?.pageSize || 10), 100),
-      pageNumber: Number(req.body?.pageNumber || 1),
-      ...(req.body?.natures      ? { natures:      req.body.natures }      : {}),
-      ...(req.body?.legalStatus  ? { legalStatus:  req.body.legalStatus }  : {}),
-      ...(req.body?.sort         ? { sort:         req.body.sort }         : {}),
-      ...(req.body?.secondSort   ? { secondSort:   req.body.secondSort }   : {}),
+    const payload = { pageSize: Math.min(Number(req.body?.pageSize || 10), 100), pageNumber: Number(req.body?.pageNumber || 1),
+      ...(req.body?.natures         ? { natures:         req.body.natures }         : {}),
+      ...(req.body?.legalStatus     ? { legalStatus:     req.body.legalStatus }     : {}),
+      ...(req.body?.sort            ? { sort:            req.body.sort }            : {}),
+      ...(req.body?.secondSort      ? { secondSort:      req.body.secondSort }      : {}),
       ...(req.body?.signatureDate   ? { signatureDate:   req.body.signatureDate }   : {}),
       ...(req.body?.publicationDate ? { publicationDate: req.body.publicationDate } : {}),
     };
-    const upstream = await callLegifrance('/list/loda', payload);
-    res.json({ ok: true, path_used: '/list/loda', ...upstream });
+    res.json({ ok: true, path_used: '/list/loda', ...await callLegifrance('/list/loda', payload) });
   } catch (err) {
-    if (err.status === 503)
-      return res.status(503).json({ ok: false, retryable: true, message: 'Service LODA indisponible' });
+    if (err.status === 503) return res.status(503).json({ ok: false, retryable: true, message: 'Service LODA indisponible' });
     handleError(res, err);
   }
 });
 
-// ─── Conventions collectives (KALI) ──────────────────────────────────────────
+// ─── Dossiers législatifs ─────────────────────────────────────────────────────
+
+app.post('/lf/consult/dossier-legislatif', async (req, res) => {
+  const id = normalizeWhitespace(req.body?.id || '');
+  if (!id) return res.status(400).json({ ok: false, message: 'id est requis' });
+  try { res.json({ ok: true, path_used: '/consult/dossierLegislatif', id, ...await callLegifrance('/consult/dossierLegislatif', { id }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+app.post('/lf/list/dossiers-legislatifs', async (req, res) => {
+  const { type, legislatureId } = req.body || {};
+  if (!type || !legislatureId) return res.status(400).json({ ok: false, message: 'type et legislatureId sont requis' });
+  try { res.json({ ok: true, path_used: '/list/dossiersLegislatifs', ...await callLegifrance('/list/dossiersLegislatifs', { type, legislatureId: Number(legislatureId) }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+// ─── CNIL ─────────────────────────────────────────────────────────────────────
+
+app.post('/lf/consult/cnil', async (req, res) => {
+  const textId = normalizeWhitespace(req.body?.textId || '');
+  const query  = normalizeSyntaxOnly(req.body?.query || '');
+  if (textId) {
+    try { return res.json({ ok: true, mode: 'consult', path_used: '/consult/cnil', textId, result: await callLegifrance('/consult/cnil', { textId, ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}) }) }); }
+    catch (err) { return handleError(res, err); }
+  }
+  if (!query) return res.status(400).json({ ok: false, message: 'textId ou query est requis' });
+  try {
+    const upstream = await callLegifrance('/search', buildSearchPayload(query, { fond: 'CNIL', pageSize: req.body?.pageSize || 10 }));
+    res.json({ ok: true, mode: 'search', path_used: '/search', totalResultNumber: upstream.totalResultNumber, results: upstream.results || [],
+      routing: { query, fond_used: 'CNIL', endpoint_called: '/lf/consult/cnil' } });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── KALI ─────────────────────────────────────────────────────────────────────
 
 app.post('/lf/list/conventions', async (req, res) => {
   try {
-    const payload = {
-      pageSize:   Math.min(Number(req.body?.pageSize || 10), 100),
-      pageNumber: Number(req.body?.pageNumber || 1),
+    const payload = { pageSize: Math.min(Number(req.body?.pageSize || 10), 100), pageNumber: Number(req.body?.pageNumber || 1),
       ...(req.body?.titre       ? { titre:       req.body.titre }       : {}),
       ...(req.body?.idcc        ? { idcc:        req.body.idcc }        : {}),
       ...(req.body?.keyWords    ? { keyWords:    req.body.keyWords }    : {}),
       ...(req.body?.legalStatus ? { legalStatus: req.body.legalStatus } : {}),
       ...(req.body?.sort        ? { sort:        req.body.sort }        : {}),
     };
-    const upstream = await callLegifrance('/list/conventions', payload);
-    res.json({ ok: true, path_used: '/list/conventions', ...upstream });
+    res.json({ ok: true, path_used: '/list/conventions', ...await callLegifrance('/list/conventions', payload) });
   } catch (err) {
-    if (err.status === 503)
-      return res.status(503).json({ ok: false, retryable: true, message: 'Service conventions indisponible' });
+    if (err.status === 503) return res.status(503).json({ ok: false, retryable: true, message: 'Service conventions indisponible' });
     handleError(res, err);
   }
 });
 
-// ─── KALI – consultation texte ────────────────────────────────────────────────
-// /consult/kaliText attend : { id } (id du texte ou d'un élément enfant)
-
 app.post('/lf/consult/kali-text', async (req, res) => {
-  const id = normalizeWhitespace(req.body?.id || req.body?.idcc || '');
+  const id    = normalizeWhitespace(req.body?.id || req.body?.idcc || '');
   const query = normalizeWhitespace(req.body?.query || '');
-
-  if (!id && !query)
-    return res.status(400).json({ ok: false, message: 'id, idcc ou query est requis' });
-
+  if (!id && !query) return res.status(400).json({ ok: false, message: 'id, idcc ou query est requis' });
   try {
-    let upstream;
-    let mode = 'preview_only';
-
-    if (id) {
-      // Fallback stable : on recherche les conventions liées à l'idcc/identifiant au lieu de charger le texte intégral.
-      upstream = await callLegifrance('/list/conventions', {
-        idcc: id,
-        pageSize: 10,
-        pageNumber: 1
-      });
-      mode = 'idcc_search_fallback';
-    } else {
-      upstream = await callLegifrance('/list/conventions', {
-        titre: query,
-        pageSize: 10,
-        pageNumber: 1
-      });
-      mode = 'query_search_fallback';
-    }
-
-    const results = (upstream.results || []).slice(0, 10);
-    res.json({
-      ok: true,
-      path_used: '/list/conventions',
-      mode,
-      totalResultNumber: upstream.totalResultNumber ?? results.length,
-      returnedCount: results.length,
-      results
-    });
+    const kaliId = id || await resolveKaliId(query);
+    if (!kaliId) return res.status(404).json({ ok: false, message: 'Convention introuvable: ' + query });
+    res.json({ ok: true, path_used: '/consult/kaliText', id: kaliId, result: await callLegifrance('/consult/kaliText', { id: kaliId }) });
   } catch (err) { handleError(res, err); }
 });
 
-// /consult/kaliContIdcc attend : { id } (id = numéro IDCC ou identifiant)
+app.post('/lf/consult/kali-cont', async (req, res) => {
+  const id    = normalizeWhitespace(req.body?.id || req.body?.idcc || '');
+  const query = normalizeWhitespace(req.body?.query || '');
+  if (!id && !query) return res.status(400).json({ ok: false, message: 'id, idcc ou query est requis' });
+  try {
+    const kaliId = id || await resolveKaliId(query);
+    if (!kaliId) return res.status(404).json({ ok: false, message: 'Convention introuvable: ' + query });
+    res.json({ ok: true, path_used: '/consult/kaliCont', id: kaliId, result: await callLegifrance('/consult/kaliCont', { id: kaliId, ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}) }) });
+  } catch (err) { handleError(res, err); }
+});
 
 app.post('/lf/consult/kali-cont-idcc', async (req, res) => {
   const id = normalizeWhitespace(req.body?.idcc || req.body?.id || '');
-  if (!id)
-    return res.status(400).json({ ok: false, message: 'idcc (ou id) est requis' });
+  if (!id) return res.status(400).json({ ok: false, message: 'idcc (ou id) est requis' });
+  try { res.json({ ok: true, path_used: '/consult/kaliContIdcc', id, result: await callLegifrance('/consult/kaliContIdcc', { id }) }); }
+  catch (err) { handleError(res, err); }
+});
 
+app.post('/lf/consult/kali-section', async (req, res) => {
+  const id = normalizeWhitespace(req.body?.id || '');
+  if (!id) return res.status(400).json({ ok: false, message: 'id est requis (identifiant de section KALI)' });
+  try { res.json({ ok: true, path_used: '/consult/kaliSection', id, result: await callLegifrance('/consult/kaliSection', { id }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+app.post('/lf/consult/kali-article', async (req, res) => {
+  const id = normalizeWhitespace(req.body?.id || '');
+  if (!id) return res.status(400).json({ ok: false, message: 'id est requis (identifiant article KALI)' });
+  try { res.json({ ok: true, path_used: '/consult/kaliArticle', id, result: await callLegifrance('/consult/kaliArticle', { id }) }); }
+  catch (err) { handleError(res, err); }
+});
+
+app.post('/lf/consult/acco', async (req, res) => {
+  const id    = normalizeWhitespace(req.body?.id || '');
+  const query = normalizeSyntaxOnly(req.body?.query || '');
+  if (id) {
+    try { return res.json({ ok: true, path_used: '/consult/acco', id, result: await callLegifrance('/consult/acco', { id }) }); }
+    catch (err) { return handleError(res, err); }
+  }
+  if (!query) return res.status(400).json({ ok: false, message: 'id ou query est requis' });
   try {
-    const upstream = await callLegifrance('/list/conventions', {
-      idcc: id,
-      pageSize: 10,
-      pageNumber: 1
-    });
-    const results = (upstream.results || []).slice(0, 10);
-    res.json({
-      ok: true,
-      path_used: '/list/conventions',
-      mode: 'idcc_search_fallback',
-      idcc: id,
-      totalResultNumber: upstream.totalResultNumber ?? results.length,
-      returnedCount: results.length,
-      results
-    });
+    const upstream = await callLegifrance('/search', buildSearchPayload(query, { fond: 'ACCO', pageSize: req.body?.pageSize || 10 }));
+    res.json({ ok: true, mode: 'search', path_used: '/search', totalResultNumber: upstream.totalResultNumber, results: upstream.results || [],
+      routing: { query, fond_used: 'ACCO', endpoint_called: '/lf/consult/acco' } });
   } catch (err) { handleError(res, err); }
+});
+
+// ─── Jurisprudence Légifrance (CETAT / CONSTIT / JUFI) ───────────────────────
+
+app.post('/lf/juri', async (req, res) => {
+  const textId = normalizeWhitespace(req.body?.textId || '');
+  const query  = normalizeSyntaxOnly(req.body?.query || '');
+  if (textId) {
+    try { return res.json({ ok: true, mode: 'consult', path_used: '/consult/juri', textId, result: await callLegifrance('/consult/juri', { textId, ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}) }) }); }
+    catch (err) { return handleError(res, err); }
+  }
+  if (!query) return res.status(400).json({ ok: false, message: 'textId ou query est requis' });
+  try {
+    const fond = /\bconseil d[' ]état\b|\bcetat\b|\badministratif\b/i.test(query) ? 'CETAT' : /\bconseil constitu/i.test(query) ? 'CONSTIT' : 'JURI';
+    const upstream = await callLegifrance('/search', buildSearchPayload(query, { fond, pageSize: req.body?.pageSize || 10 }));
+    res.json({ ok: true, mode: 'search', path_used: '/search', totalResultNumber: upstream.totalResultNumber, results: upstream.results || [],
+      routing: { query, fond_used: fond, endpoint_called: '/lf/juri' } });
+  } catch (err) { handleError(res, err); }
+});
+
+// ─── Chronologie ─────────────────────────────────────────────────────────────
+
+app.get('/lf/chrono/:textCid', async (req, res) => {
+  const textCid = normalizeWhitespace(req.params?.textCid || '');
+  if (!textCid) return res.status(400).json({ ok: false, message: 'textCid est requis' });
+  try { res.json({ ok: true, path_used: '/chrono/textCid/' + textCid, result: await callLegifrance('/chrono/textCid/' + encodeURIComponent(textCid), {}, 'GET') }); }
+  catch (err) { handleError(res, err); }
 });
 
 // ─── Judilibre ────────────────────────────────────────────────────────────────
 
 app.get('/jd/search', async (req, res) => {
   const query = normalizeSyntaxOnly(req.query?.query || '');
-  if (!query)
-    return res.status(400).json({ ok: false, message: 'query est requis' });
-
+  if (!query) return res.status(400).json({ ok: false, message: 'query est requis' });
   try {
-    const params = {
-      query,
-      operator:          req.query?.operator          || 'and',
-      page_size:         Number(req.query?.page_size  || 10),
-      page:              Number(req.query?.page        || 0),
-      ...(req.query?.field        ? { field:        req.query.field }        : {}),
-      ...(req.query?.type         ? { type:         req.query.type }         : {}),
-      ...(req.query?.chamber      ? { chamber:      req.query.chamber }      : {}),
-      ...(req.query?.jurisdiction ? { jurisdiction: req.query.jurisdiction } : {}),
-      ...(req.query?.solution     ? { solution:     req.query.solution }     : {}),
-      ...(req.query?.date_start   ? { date_start:   req.query.date_start }   : {}),
-      ...(req.query?.date_end     ? { date_end:     req.query.date_end }     : {}),
-      ...(req.query?.sort         ? { sort:         req.query.sort }         : {}),
-      ...(req.query?.order        ? { order:        req.query.order }        : {}),
-      ...(req.query?.resolve_references ? { resolve_references: req.query.resolve_references } : {}),
-    };
-    const data = await callJudilibre('/search', params);
-    res.json({
-      ok:   true,
-      path_used: '/search',
-      ...data,
-      routing: { user_query: req.query.query, normalized_query: query,
-                 intent: 'JURISPRUDENCE', endpoint_called: '/jd/search' },
-    });
-  } catch (err) { handleError(res, err); }
-});
-
-app.get('/jd/decision', async (req, res) => {
-  const id                = normalizeWhitespace(req.query?.id || '');
-  const resolve_references = String(req.query?.resolve_references || 'false') === 'true';
-  if (!id)
-    return res.status(400).json({ ok: false, message: 'id est requis' });
-  try {
-    const data = await callJudilibre('/decision', {
-      id,
-      resolve_references,
-      ...(req.query?.query    ? { query:    req.query.query }    : {}),
-      ...(req.query?.operator ? { operator: req.query.operator } : {}),
-    });
-    res.json({ ok: true, path_used: '/decision', ...data });
-  } catch (err) { handleError(res, err); }
-});
-
-// ─── Jurisprudence Légifrance (CETAT / JUFI / CONSTIT) ───────────────────────
-// Distinct de Judilibre : couvre Conseil d'État, Conseil constitutionnel, etc.
-
-app.post('/lf/juri', async (req, res) => {
-  const textId = normalizeWhitespace(req.body?.textId || '');
-  const query  = normalizeSyntaxOnly(req.body?.query || '');
-
-  if (textId) {
-    // Consultation directe par textId connu
-    try {
-      const result = await callLegifrance('/consult/juri', {
-        textId,
-        ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}),
-      });
-      return res.json({ ok: true, mode: 'consult', path_used: '/consult/juri', result });
-    } catch (err) { return handleError(res, err); }
-  }
-
-  if (!query)
-    return res.status(400).json({ ok: false, message: 'textId ou query est requis' });
-
-  // Recherche full-text, fonds JURI / CETAT / CONSTIT détectés automatiquement
-  try {
-    const fond = /\bconseil d[' ]état\b|\bcetat\b|\badministratif\b/i.test(query)
-      ? 'CETAT'
-      : /\bconseil constitu/i.test(query) ? 'CONSTIT' : 'JURI';
-    const payload  = buildSearchPayload(query, { fond, pageSize: req.body?.pageSize || 10 });
-    const upstream = await callLegifrance('/search', payload);
-    res.json({
-      ok: true, mode: 'search', path_used: '/search',
-      totalResultNumber: upstream.totalResultNumber,
-      results: upstream.results || [],
-      routing: { query, fond_used: fond, endpoint_called: '/lf/juri' },
-    });
-  } catch (err) { handleError(res, err); }
-});
-
-// ─── Consultation d'un code Légifrance (texte consolidé complet) ───────────────
-// /consult/code attend : { textId (LEGITEXT…), date, sctCid? }
-
-app.post('/lf/consult/code', async (req, res) => {
-  const textId   = normalizeWhitespace(req.body?.textId || '');
-  const codeTerms = normalizeWhitespace(req.body?.codeTerms || '');
-  const date      = normalizeWhitespace(req.body?.date || new Date().toISOString().split('T')[0]);
-
-  try {
-    let resolvedTextId = textId;
-
-    // Si on n'a pas de textId, résoudre via /list/code
-    if (!resolvedTextId && codeTerms) {
-      const codeList = await callLegifrance('/list/code', {
-        codeName:   codeTerms,
-        pageSize:   3,
-        pageNumber: 1,
-        states:     ['VIGUEUR'],
-      });
-      resolvedTextId = (codeList.results || [])[0]?.cid || '';
-      if (!resolvedTextId)
-        return res.status(404).json({ ok: false, message: `Code introuvable: ${codeTerms}` });
-    }
-
-    if (!resolvedTextId)
-      return res.status(400).json({ ok: false, message: 'textId ou codeTerms est requis' });
-
-    const result = await callLegifrance('/consult/code', {
-      textId:   resolvedTextId,
-      date,
-      ...(req.body?.sctCid    ? { sctCid:    req.body.sctCid }    : {}),
-      ...(req.body?.abrogated ? { abrogated: req.body.abrogated } : {}),
-    });
-    res.json({ ok: true, path_used: '/consult/code', textId: resolvedTextId, date, result });
-  } catch (err) { handleError(res, err); }
-});
-
-// ─── Accords d'entreprise (ACCO) ─────────────────────────────────────────────
-
-app.post('/lf/consult/acco', async (req, res) => {
-  const id    = normalizeWhitespace(req.body?.id || '');
-  const query = normalizeSyntaxOnly(req.body?.query || '');
-
-  if (id) {
-    try {
-      const result = await callLegifrance('/consult/acco', { id });
-      return res.json({ ok: true, path_used: '/consult/acco', id, result });
-    } catch (err) { return handleError(res, err); }
-  }
-
-  if (!query)
-    return res.status(400).json({ ok: false, message: 'id ou query est requis' });
-
-  try {
-    const payload  = buildSearchPayload(query, { fond: 'ACCO', pageSize: req.body?.pageSize || 10 });
-    const upstream = await callLegifrance('/search', payload);
-    res.json({
-      ok: true, mode: 'search', path_used: '/search',
-      totalResultNumber: upstream.totalResultNumber,
-      results: upstream.results || [],
-      routing: { query, fond_used: 'ACCO', endpoint_called: '/lf/consult/acco' },
-    });
-  } catch (err) { handleError(res, err); }
-});
-
-// ─── Historique chronologique d'un texte ─────────────────────────────────────
-
-app.get('/lf/chrono/:textCid', async (req, res) => {
-  const textCid = normalizeWhitespace(req.params?.textCid || '');
-  if (!textCid)
-    return res.status(400).json({ ok: false, message: 'textCid est requis' });
-  try {
-    const result = await callLegifrance(`/chrono/textCid/${encodeURIComponent(textCid)}`, {}, 'GET');
-    res.json({ ok: true, path_used: `/chrono/textCid/${textCid}`, result });
-  } catch (err) { handleError(res, err); }
-});
-
-// ─── Judilibre – scan (export par lot) ───────────────────────────────────────
-
-app.get('/jd/scan', async (req, res) => {
-  try {
-    const params = {
+    const params = { query, operator: req.query?.operator || 'and', page_size: Number(req.query?.page_size || 10), page: Number(req.query?.page || 0),
+      ...(req.query?.field             ? { field:             req.query.field }             : {}),
       ...(req.query?.type              ? { type:              req.query.type }              : {}),
       ...(req.query?.chamber           ? { chamber:           req.query.chamber }           : {}),
       ...(req.query?.jurisdiction      ? { jurisdiction:      req.query.jurisdiction }      : {}),
@@ -975,43 +788,68 @@ app.get('/jd/scan', async (req, res) => {
       ...(req.query?.publication       ? { publication:       req.query.publication }       : {}),
       ...(req.query?.date_start        ? { date_start:        req.query.date_start }        : {}),
       ...(req.query?.date_end          ? { date_end:          req.query.date_end }          : {}),
-      ...(req.query?.date_type         ? { date_type:         req.query.date_type }         : {}),
+      ...(req.query?.sort              ? { sort:              req.query.sort }              : {}),
       ...(req.query?.order             ? { order:             req.query.order }             : {}),
-      ...(req.query?.batch_size        ? { batch_size:        Number(req.query.batch_size) } : {}),
-      ...(req.query?.search_after      ? { search_after:      req.query.search_after }      : {}),
       ...(req.query?.resolve_references ? { resolve_references: req.query.resolve_references } : {}),
-      ...(req.query?.abridged          ? { abridged:          req.query.abridged }          : {}),
+      ...(req.query?.withFileOfType    ? { withFileOfType:    req.query.withFileOfType }    : {}),
       ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
     };
-    const data = await callJudilibre('/scan', params);
-    res.json({ ok: true, path_used: '/scan', ...data });
+    res.json({ ok: true, path_used: '/search', ...await callJudilibre('/search', params),
+      routing: { user_query: req.query.query, normalized_query: query, intent: 'JURISPRUDENCE', endpoint_called: '/jd/search' } });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── Judilibre – export (lot numéroté) ───────────────────────────────────────
+app.get('/jd/decision', async (req, res) => {
+  const id = normalizeWhitespace(req.query?.id || '');
+  if (!id) return res.status(400).json({ ok: false, message: 'id est requis' });
+  try {
+    res.json({ ok: true, path_used: '/decision', ...await callJudilibre('/decision', { id, resolve_references: String(req.query?.resolve_references || 'false') === 'true', ...(req.query?.query ? { query: req.query.query } : {}), ...(req.query?.operator ? { operator: req.query.operator } : {}) }) });
+  } catch (err) { handleError(res, err); }
+});
+
+app.get('/jd/scan', async (req, res) => {
+  try {
+    const params = {
+      ...(req.query?.type              ? { type:              req.query.type }                  : {}),
+      ...(req.query?.chamber           ? { chamber:           req.query.chamber }               : {}),
+      ...(req.query?.jurisdiction      ? { jurisdiction:      req.query.jurisdiction }          : {}),
+      ...(req.query?.solution          ? { solution:          req.query.solution }              : {}),
+      ...(req.query?.publication       ? { publication:       req.query.publication }           : {}),
+      ...(req.query?.date_start        ? { date_start:        req.query.date_start }            : {}),
+      ...(req.query?.date_end          ? { date_end:          req.query.date_end }              : {}),
+      ...(req.query?.date_type         ? { date_type:         req.query.date_type }             : {}),
+      ...(req.query?.order             ? { order:             req.query.order }                 : {}),
+      ...(req.query?.batch_size        ? { batch_size:        Number(req.query.batch_size) }    : {}),
+      ...(req.query?.search_after      ? { search_after:      req.query.search_after }          : {}),
+      ...(req.query?.resolve_references ? { resolve_references: req.query.resolve_references }  : {}),
+      ...(req.query?.abridged          ? { abridged:          req.query.abridged }              : {}),
+      ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest }  : {}),
+      ...(req.query?.withFileOfType    ? { withFileOfType:    req.query.withFileOfType }        : {}),
+    };
+    res.json({ ok: true, path_used: '/scan', ...await callJudilibre('/scan', params) });
+  } catch (err) { handleError(res, err); }
+});
 
 app.get('/jd/export', async (req, res) => {
   try {
     const params = {
-      ...(req.query?.type         ? { type:         req.query.type }         : {}),
-      ...(req.query?.chamber      ? { chamber:      req.query.chamber }      : {}),
-      ...(req.query?.jurisdiction ? { jurisdiction: req.query.jurisdiction } : {}),
-      ...(req.query?.solution     ? { solution:     req.query.solution }     : {}),
-      ...(req.query?.date_start   ? { date_start:   req.query.date_start }   : {}),
-      ...(req.query?.date_end     ? { date_end:     req.query.date_end }     : {}),
-      ...(req.query?.date_type    ? { date_type:    req.query.date_type }    : {}),
-      ...(req.query?.order        ? { order:        req.query.order }        : {}),
-      ...(req.query?.batch_size   ? { batch_size:   Number(req.query.batch_size) } : {}),
-      ...(req.query?.batch        ? { batch:        Number(req.query.batch) }       : {}),
+      ...(req.query?.type              ? { type:              req.query.type }              : {}),
+      ...(req.query?.chamber           ? { chamber:           req.query.chamber }           : {}),
+      ...(req.query?.jurisdiction      ? { jurisdiction:      req.query.jurisdiction }      : {}),
+      ...(req.query?.solution          ? { solution:          req.query.solution }          : {}),
+      ...(req.query?.date_start        ? { date_start:        req.query.date_start }        : {}),
+      ...(req.query?.date_end          ? { date_end:          req.query.date_end }          : {}),
+      ...(req.query?.date_type         ? { date_type:         req.query.date_type }         : {}),
+      ...(req.query?.order             ? { order:             req.query.order }             : {}),
+      ...(req.query?.batch_size        ? { batch_size:        Number(req.query.batch_size) } : {}),
+      ...(req.query?.batch             ? { batch:             Number(req.query.batch) }      : {}),
       ...(req.query?.resolve_references ? { resolve_references: req.query.resolve_references } : {}),
-      ...(req.query?.abridged     ? { abridged:     req.query.abridged }     : {}),
+      ...(req.query?.abridged          ? { abridged:          req.query.abridged }          : {}),
+      ...(req.query?.withFileOfType    ? { withFileOfType:    req.query.withFileOfType }    : {}),
     };
-    const data = await callJudilibre('/export', params);
-    res.json({ ok: true, path_used: '/export', ...data });
+    res.json({ ok: true, path_used: '/export', ...await callJudilibre('/export', params) });
   } catch (err) { handleError(res, err); }
 });
-
-// ─── Judilibre – taxonomie ────────────────────────────────────────────────────
 
 app.get('/jd/taxonomy', async (req, res) => {
   try {
@@ -1021,48 +859,50 @@ app.get('/jd/taxonomy', async (req, res) => {
       ...(req.query?.value         ? { value:         req.query.value }         : {}),
       ...(req.query?.context_value ? { context_value: req.query.context_value } : {}),
     };
-    const data = await callJudilibre('/taxonomy', params);
-    res.json({ ok: true, path_used: '/taxonomy', ...data });
+    res.json({ ok: true, path_used: '/taxonomy', ...await callJudilibre('/taxonomy', params) });
   } catch (err) { handleError(res, err); }
 });
-
-// ─── Judilibre – statistiques ─────────────────────────────────────────────────
 
 app.get('/jd/stats', async (req, res) => {
   try {
     const params = {
-      ...(req.query?.jurisdiction      ? { jurisdiction:      req.query.jurisdiction }      : {}),
-      ...(req.query?.location          ? { location:          req.query.location }          : {}),
-      ...(req.query?.date_start        ? { date_start:        req.query.date_start }        : {}),
-      ...(req.query?.date_end          ? { date_end:          req.query.date_end }          : {}),
+      ...(req.query?.jurisdiction       ? { jurisdiction:       req.query.jurisdiction }       : {}),
+      ...(req.query?.location           ? { location:           req.query.location }           : {}),
+      ...(req.query?.date_start         ? { date_start:         req.query.date_start }         : {}),
+      ...(req.query?.date_end           ? { date_end:           req.query.date_end }           : {}),
       ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
-      ...(req.query?.keys              ? { keys:              req.query.keys }              : {}),
+      ...(req.query?.keys               ? { keys:               req.query.keys }               : {}),
     };
-    const data = await callJudilibre('/stats', params);
-    res.json({ ok: true, path_used: '/stats', ...data });
+    res.json({ ok: true, path_used: '/stats', ...await callJudilibre('/stats', params) });
   } catch (err) { handleError(res, err); }
 });
-
-// ─── Judilibre – historique transactionnel ────────────────────────────────────
 
 app.get('/jd/transactionalhistory', async (req, res) => {
   const date = normalizeWhitespace(req.query?.date || '');
-  if (!date)
-    return res.status(400).json({ ok: false, message: 'date est requis (YYYY-MM-DD)' });
+  if (!date) return res.status(400).json({ ok: false, message: 'date est requis (YYYY-MM-DD)' });
   try {
-    const params = {
-      date,
-      ...(req.query?.page_size ? { page_size: Number(req.query.page_size) } : {}),
-      ...(req.query?.from_id   ? { from_id:   req.query.from_id }           : {}),
-    };
-    const data = await callJudilibre('/transactionalhistory', params);
-    res.json({ ok: true, path_used: '/transactionalhistory', ...data });
+    res.json({ ok: true, path_used: '/transactionalhistory', ...await callJudilibre('/transactionalhistory', { date, ...(req.query?.page_size ? { page_size: Number(req.query.page_size) } : {}), ...(req.query?.from_id ? { from_id: req.query.from_id } : {}) }) });
   } catch (err) { handleError(res, err); }
 });
 
-// ─── Démarrage ────────────────────────────────────────────────────────────────
+// ─── 404 catch-all ────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`proxy-avocat ${VERSION} (${USE_SANDBOX ? 'SANDBOX' : 'PRODUCTION'}) listening on ${PORT}`)
+app.use((_req, res) => {
+  res.status(404).json({ ok: false, message: 'Endpoint introuvable. Voir GET /health.' });
+});
+
+// ─── Démarrage & arrêt propre ─────────────────────────────────────────────────
+
+validateEnv();
+const PORT   = process.env.PORT || 3000;
+const server = app.listen(PORT, () =>
+  log.info('proxy-avocat ' + VERSION + ' (' + (USE_SANDBOX ? 'SANDBOX' : 'PRODUCTION') + ') en ecoute sur le port ' + PORT)
 );
+
+function gracefulShutdown(signal) {
+  log.info('Signal ' + signal + ' recu, fermeture propre...');
+  server.close(() => { log.info('Serveur HTTP ferme.'); process.exit(0); });
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
