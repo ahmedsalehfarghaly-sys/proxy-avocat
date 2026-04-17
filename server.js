@@ -1,7 +1,16 @@
 /**
- * proxy-avocat v4.3.3  –  patch nearestVersion + garde-fous JORF
+ * proxy-avocat v4.3.2  –  complet
  *
  * Prérequis : Node 18+  (fetch natif)
+ *
+ * Variables d'environnement :
+ *   LF_CLIENT_ID       – client_id PISTE pour Légifrance
+ *   LF_CLIENT_SECRET   – client_secret PISTE pour Légifrance
+ *   JD_CLIENT_ID       – client_id PISTE pour Judilibre  (fallback: LF_CLIENT_ID)
+ *   JD_CLIENT_SECRET   – client_secret PISTE pour Judilibre (fallback: LF_CLIENT_SECRET)
+ *   USE_SANDBOX        – "false" pour basculer sur l'API de production (défaut: sandbox)
+ *   LOG_LEVEL          – "none" | "error" | "info" | "debug"  (défaut: "info")
+ *   PORT               – port d'écoute (défaut: 3000)
  */
 
 'use strict';
@@ -13,7 +22,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-const VERSION = 'v4.3.3-patched';
+const VERSION = 'v4.3.2-complet';
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -26,6 +35,7 @@ const log = {
   debug: (...a) => LOG_LEVEL >= LEVELS.debug && console.log('[DBG]', new Date().toISOString(), ...a),
 };
 
+// Middleware de logging des requêtes entrantes
 app.use((req, _res, next) => {
   log.debug(`-> ${req.method} ${req.path}`, req.body || req.query);
   next();
@@ -52,7 +62,7 @@ const LF_CLIENT_SECRET = process.env.LF_CLIENT_SECRET || '';
 const JD_CLIENT_ID     = process.env.JD_CLIENT_ID     || LF_CLIENT_ID;
 const JD_CLIENT_SECRET = process.env.JD_CLIENT_SECRET || LF_CLIENT_SECRET;
 
-// ─── Validation environnement ────────────────────────────────────────────────
+// ─── Validation des variables d'environnement au démarrage ───────────────────
 
 function validateEnv() {
   const missing = [];
@@ -102,16 +112,19 @@ async function getToken(clientId, clientSecret) {
   return data.access_token;
 }
 
-// ─── Retry ───────────────────────────────────────────────────────────────────
+// ─── Retry avec backoff exponentiel ──────────────────────────────────────────
+// Réessaie sur 429 (rate-limit) et 503 (service indisponible).
+// Sur 401, invalide le cache et réessaie une fois (token révoqué côté serveur).
 
 const RETRY_STATUSES = new Set([429, 503]);
-const RETRY_DELAYS   = [500, 1500, 4000];
+const RETRY_DELAYS   = [500, 1500, 4000]; // ms
 
 async function fetchWithRetry(url, options, clientId, clientSecret) {
   let attempt = 0;
   while (true) {
     const res = await fetch(url, options);
 
+    // Token révoqué avant expiration locale
     if (res.status === 401 && attempt === 0) {
       log.debug('401 recu, purge du cache token et retry');
       delete _tokens[clientId];
@@ -134,57 +147,9 @@ async function fetchWithRetry(url, options, clientId, clientSecret) {
   }
 }
 
-// ─── Helpers patch ───────────────────────────────────────────────────────────
-
-function buildProxyError(code, message, details) {
-  const err = new Error(message);
-  err.code = code;
-  err.details = details || {};
-  return err;
-}
-
-function assertJorfInput(path, payload = {}) {
-  if (path === '/consult/jorf') {
-    const hasNor = typeof payload.nor === 'string' && payload.nor.trim() !== '';
-    const hasTextId = typeof payload.textId === 'string' && payload.textId.trim() !== '';
-    if (!hasNor && !hasTextId) {
-      throw buildProxyError(
-        'JORF_INPUT_INVALID',
-        'La route /consult/jorf exige au minimum nor ou textId.',
-        { path, payload }
-      );
-    }
-  }
-}
-
-function normalizeLegiId(id) {
-  if (!id || typeof id !== 'string') return { kind: 'unknown', id };
-  if (id.startsWith('LEGIARTI')) return { kind: 'article', id };
-  if (id.startsWith('LEGITEXT')) return { kind: 'text', id };
-  return { kind: 'unknown', id };
-}
-
-async function safeCall(fn) {
-  try {
-    return await fn();
-  } catch {
-    return null;
-  }
-}
-
-function extractUpstreamError(err) {
-  return {
-    status: err?.status ?? err?.response?.status ?? null,
-    message: err?.upstream?.message ?? err?.message ?? 'Unknown upstream error',
-    upstream: err?.upstream ?? null,
-  };
-}
-
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 async function callLegifrance(path, payload = {}, method = 'POST') {
-  assertJorfInput(path, payload);
-
   const token = await getToken(LF_CLIENT_ID, LF_CLIENT_SECRET);
   const url   = LF_BASE + path;
 
@@ -201,9 +166,8 @@ async function callLegifrance(path, payload = {}, method = 'POST') {
   log.debug('LF ' + method + ' ' + path);
   const res  = await fetchWithRetry(url, options, LF_CLIENT_ID, LF_CLIENT_SECRET);
   const data = await res.json().catch(() => ({}));
-
   if (!res.ok) {
-    log.error('LF ' + res.status + ' ' + path, JSON.stringify(data).slice(0, 400));
+    log.error('LF ' + res.status + ' ' + path, JSON.stringify(data).slice(0, 200));
     const err = new Error('Legifrance ' + res.status + ' ' + path);
     err.status   = res.status;
     err.upstream = data;
@@ -238,163 +202,12 @@ async function callJudilibre(path, queryParams = {}) {
   return data;
 }
 
-// ─── nearestVersion patch ────────────────────────────────────────────────────
-
-async function resolveParentTextIdFromArticle(articleId) {
-  const article = await safeCall(() =>
-    callLegifrance('/consult/getArticleByCid', { cid: articleId })
-  );
-
-  const maybeTextId =
-    article?.listArticle?.[0]?.idTexte ||
-    article?.article?.idTexte ||
-    article?.article?.textTitles?.[0]?.id ||
-    null;
-
-  return (typeof maybeTextId === 'string' && maybeTextId.startsWith('LEGITEXT'))
-    ? maybeTextId
-    : null;
-}
-
-async function safeNearestVersion(textId, date) {
-  try {
-    const result = await callLegifrance('/search/nearestVersion', { textId, date });
-    return { ok: true, mode: 'nearest_version', result };
-  } catch (err) {
-    const upstream = extractUpstreamError(err);
-
-    if ((err?.status || err?.response?.status) === 500) {
-      log.error('LF nearestVersion failed', {
-        path: '/search/nearestVersion',
-        textId,
-        date,
-        idKind: normalizeLegiId(textId).kind,
-        status: upstream.status,
-        upstreamMessage: upstream.message,
-      });
-
-      return {
-        ok: false,
-        code: 'UPSTREAM_NEAREST_VERSION_500',
-        message: 'Légifrance a renvoyé une erreur 500 sur /search/nearestVersion.',
-        details: {
-          path: '/search/nearestVersion',
-          textId,
-          date,
-          upstream,
-          fallbackEligible: true,
-        },
-      };
-    }
-
-    throw err;
-  }
-}
-
-async function fallbackForText(textId, date) {
-  const consolidated = await safeCall(() =>
-    callLegifrance('/consult/code', { textId, date })
-  );
-
-  if (consolidated) {
-    return {
-      ok: true,
-      mode: 'fallback_code_consolidated',
-      result: consolidated,
-    };
-  }
-
-  return {
-    ok: false,
-    code: 'FALLBACK_TEXT_FAILED',
-    message: 'Impossible de récupérer un texte consolidé en repli.',
-    details: { textId, date },
-  };
-}
-
-async function fallbackForArticle(articleId, date) {
-  const directArticle = await safeCall(() =>
-    callLegifrance('/consult/getArticleByCid', { cid: articleId })
-  );
-
-  const directArticles = directArticle?.listArticle;
-  if (Array.isArray(directArticles) && directArticles.length > 0) {
-    return {
-      ok: true,
-      mode: 'fallback_article_direct',
-      result: directArticle,
-    };
-  }
-
-  const parentTextId = await resolveParentTextIdFromArticle(articleId);
-  if (parentTextId) {
-    const nearest = await safeNearestVersion(parentTextId, date);
-    if (nearest.ok) return nearest;
-
-    const textFallback = await fallbackForText(parentTextId, date);
-    if (textFallback.ok) return textFallback;
-
-    return {
-      ok: false,
-      code: 'ARTICLE_PARENT_TEXT_FALLBACK_FAILED',
-      message: "L'article a été résolu vers un texte parent, mais aucun repli exploitable n'a abouti.",
-      details: {
-        articleId,
-        parentTextId,
-        date,
-        nearestError: nearest,
-        textFallback,
-      },
-    };
-  }
-
-  return {
-    ok: false,
-    code: 'ARTICLE_REQUIRES_RESOLUTION',
-    message: 'Identifiant article fourni sans possibilité de résolution robuste vers un texte parent.',
-    details: { articleId, date },
-  };
-}
-
-async function getDroitApplicableALaDateSafe(textId, date) {
-  if (!textId || !date) {
-    return {
-      ok: false,
-      code: 'INPUT_INVALID',
-      message: 'textId et date sont requis.',
-      details: { textId, date },
-    };
-  }
-
-  const normalized = normalizeLegiId(textId);
-
-  if (normalized.kind === 'text') {
-    const nearest = await safeNearestVersion(normalized.id, date);
-    if (nearest.ok) return nearest;
-    return fallbackForText(normalized.id, date);
-  }
-
-  if (normalized.kind === 'article') {
-    return fallbackForArticle(normalized.id, date);
-  }
-
-  return {
-    ok: false,
-    code: 'ID_TYPE_UNKNOWN',
-    message: "Le type d'identifiant n'est pas reconnu. Attendu: LEGIARTI... ou LEGITEXT...",
-    details: { textId, date },
-  };
-}
-
 // ─── Helpers communs ──────────────────────────────────────────────────────────
 
 function handleError(res, err) {
-  log.error(err.message, err.upstream ? JSON.stringify(err.upstream).slice(0, 400) : '');
+  log.error(err.message, err.upstream ? JSON.stringify(err.upstream).slice(0, 200) : '');
   return res.status(err.status ?? 500).json({
-    ok: false,
-    message: err.message,
-    ...(err.code ? { code: err.code } : {}),
-    ...(err.details ? { details: err.details } : {}),
+    ok: false, message: err.message,
     ...(err.upstream ? { upstream: err.upstream } : {}),
   });
 }
@@ -459,7 +272,8 @@ function rerankByIntent(intent, results) {
   });
 }
 
-// ─── Rerankage contentieux ───────────────────────────────────────────────────
+// ─── Rerankage spécifique contentieux ────────────────────────────────────────
+// Hiérarchie fixe : TEXTE → JUGE → ADMINISTRATION → PROCÉDURE
 
 const CONTENTIEUX_LAYERS = {
   TEXTE:         ['LEGI','CODE','LEGIARTI','LEGITEXT'],
@@ -506,19 +320,23 @@ function buildSearchPayload(query, { fond, pageSize = 10, pageNumber = 1 } = {})
   };
 }
 
+// Résout un code par nom -> textId (LEGITEXT)
 async function resolveCodeId(codeTerms) {
   const list = await callLegifrance('/list/code', { codeName: codeTerms, pageSize: 3, pageNumber: 1, states: ['VIGUEUR'] });
   return (list.results || [])[0]?.cid || (list.results || [])[0]?.id || null;
 }
 
+// Résout une convention par query -> id KALI
 async function resolveKaliId(query) {
   const list = await callLegifrance('/list/conventions', { titre: query, pageSize: 3, pageNumber: 1 });
   return (list.results || [])[0]?.id || null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ROUTES
+//  ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Santé ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) =>
   res.json({ ok: true, service: 'proxy-avocat', version: VERSION, sandbox: USE_SANDBOX })
@@ -534,20 +352,14 @@ app.get('/jd/healthcheck', async (_req, res) => {
   catch (err) { handleError(res, err); }
 });
 
-// ─── Escape hatch patché ─────────────────────────────────────────────────────
+// ─── Escape hatch ─────────────────────────────────────────────────────────────
 
 app.post('/raw/request', async (req, res) => {
   const { api, method = 'POST', path, payload = {} } = req.body || {};
   if (!api || !path) return res.status(400).json({ ok: false, message: 'api et path sont requis' });
-
   try {
-    if (api === 'legifrance') {
-      assertJorfInput(path, payload);
-      return res.json({ ok: true, api_used: 'legifrance', path_used: path, ...await callLegifrance(path, payload, method.toUpperCase()) });
-    }
-    if (api === 'judilibre') {
-      return res.json({ ok: true, api_used: 'judilibre',  path_used: path, ...await callJudilibre(path, payload) });
-    }
+    if (api === 'legifrance') return res.json({ ok: true, api_used: 'legifrance', path_used: path, ...await callLegifrance(path, payload, method.toUpperCase()) });
+    if (api === 'judilibre')  return res.json({ ok: true, api_used: 'judilibre',  path_used: path, ...await callJudilibre(path, payload) });
     return res.status(400).json({ ok: false, message: 'api non supportee: ' + api });
   } catch (err) { handleError(res, err); }
 });
@@ -586,6 +398,7 @@ app.post('/lf/search-structured-safe', async (req, res) => {
 
 // ─── Suggestions ──────────────────────────────────────────────────────────────
 
+// /suggest attend { searchText, supplies, documentsDits }
 app.post('/lf/suggest', async (req, res) => {
   const userQuery = req.body?.query || req.body?.searchText || '';
   if (!userQuery) return res.status(400).json({ ok: false, message: 'query est requis' });
@@ -600,6 +413,7 @@ app.post('/lf/suggest', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// /suggest/acco attend { searchText }
 app.post('/lf/suggest/acco', async (req, res) => {
   const searchText = normalizeWhitespace(req.body?.query || req.body?.searchText || '');
   if (!searchText) return res.status(400).json({ ok: false, message: 'query est requis' });
@@ -607,6 +421,7 @@ app.post('/lf/suggest/acco', async (req, res) => {
   catch (err) { handleError(res, err); }
 });
 
+// /suggest/pdc attend { searchText, origin?, fond? }
 app.post('/lf/suggest/pdc', async (req, res) => {
   const searchText = normalizeWhitespace(req.body?.query || req.body?.searchText || '');
   if (!searchText) return res.status(400).json({ ok: false, message: 'query est requis' });
@@ -632,6 +447,7 @@ app.post('/lf/article-resolve', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// Stratégie en 3 étapes : getArticleWithIdAndNum -> search+getArticle -> search_only
 app.post('/lf/article-fetch', async (req, res) => {
   const articleNumber = normalizeWhitespace(req.body?.articleNumber || '');
   const codeTerms     = normalizeWhitespace(req.body?.codeTerms || '');
@@ -643,7 +459,7 @@ app.post('/lf/article-fetch', async (req, res) => {
       try {
         const article = await callLegifrance('/consult/getArticleWithIdAndNum', { id: textId, num: articleNumber });
         return res.json({ ok: true, mode: 'consult_by_id_and_num', path_used: '/consult/getArticleWithIdAndNum', textId, article, query: 'article ' + articleNumber + ' ' + codeTerms });
-      } catch {}
+      } catch { /* fallback */ }
     }
     const sr   = await callLegifrance('/search', buildSearchPayload('article ' + articleNumber + ' ' + codeTerms, { fond: 'CODE_ETAT', pageSize: 3 }));
     const best = (sr.results || [])[0] || null;
@@ -655,6 +471,7 @@ app.post('/lf/article-fetch', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// Article par CID chronologique
 app.post('/lf/consult/article-by-cid', async (req, res) => {
   const cid = normalizeWhitespace(req.body?.cid || '');
   if (!cid) return res.status(400).json({ ok: false, message: 'cid est requis' });
@@ -662,6 +479,7 @@ app.post('/lf/consult/article-by-cid', async (req, res) => {
   catch (err) { handleError(res, err); }
 });
 
+// Article par ELI ou alias
 app.post('/lf/consult/article-by-eli', async (req, res) => {
   const idEliOrAlias = normalizeWhitespace(req.body?.idEliOrAlias || req.body?.eli || '');
   if (!idEliOrAlias) return res.status(400).json({ ok: false, message: 'idEliOrAlias est requis' });
@@ -669,6 +487,7 @@ app.post('/lf/consult/article-by-eli', async (req, res) => {
   catch (err) { handleError(res, err); }
 });
 
+// Articles de même numéro dans d'autres textes
 app.post('/lf/consult/same-num-article', async (req, res) => {
   const { articleCid, articleNum, textCid, date } = req.body || {};
   if (!articleCid || !articleNum || !textCid)
@@ -702,6 +521,7 @@ app.post('/lf/code-resolve', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// Texte consolidé complet – /consult/code attend { textId, date, sctCid? }
 app.post('/lf/consult/code', async (req, res) => {
   const textId    = normalizeWhitespace(req.body?.textId || '');
   const codeTerms = normalizeWhitespace(req.body?.codeTerms || '');
@@ -714,6 +534,7 @@ app.post('/lf/consult/code', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// Partie d'un texte LEGI (sections) – /consult/legiPart attend { textId, date }
 app.post('/lf/consult/legi-part', async (req, res) => {
   const textId    = normalizeWhitespace(req.body?.textId || '');
   const codeTerms = normalizeWhitespace(req.body?.codeTerms || '');
@@ -726,6 +547,7 @@ app.post('/lf/consult/legi-part', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
+// Versions canoniques / proches
 app.post('/lf/search/canonical-version', async (req, res) => {
   const { textId, date } = req.body || {};
   if (!textId) return res.status(400).json({ ok: false, message: 'textId est requis' });
@@ -740,37 +562,14 @@ app.post('/lf/search/canonical-article', async (req, res) => {
   catch (err) { handleError(res, err); }
 });
 
-// ─── nearestVersion patché ───────────────────────────────────────────────────
-
 app.post('/lf/search/nearest-version', async (req, res) => {
   const { textId, date } = req.body || {};
   if (!textId) return res.status(400).json({ ok: false, message: 'textId est requis' });
-  try {
-    const result = await getDroitApplicableALaDateSafe(textId, normalizeWhitespace(date || today()));
-    res.json(result);
-  } catch (err) { handleError(res, err); }
+  try { res.json({ ok: true, path_used: '/search/nearestVersion', ...await callLegifrance('/search/nearestVersion', { textId, date: normalizeWhitespace(date || today()) }) }); }
+  catch (err) { handleError(res, err); }
 });
 
 // ─── JORF & LODA ─────────────────────────────────────────────────────────────
-
-// Route explicite ajoutée
-app.post('/lf/consult/jorf', async (req, res) => {
-  const nor = normalizeWhitespace(req.body?.nor || '');
-  const textId = normalizeWhitespace(req.body?.textId || '');
-  if (!nor && !textId) {
-    return res.status(400).json({
-      ok: false,
-      code: 'JORF_INPUT_INVALID',
-      message: 'La route /lf/consult/jorf exige au minimum nor ou textId',
-    });
-  }
-  try {
-    if (textId) {
-      return res.json({ ok: true, path_used: '/consult/jorf', result: await callLegifrance('/consult/jorf', { textId }) });
-    }
-    return res.json({ ok: true, path_used: '/consult/getJoWithNor', result: await callLegifrance('/consult/getJoWithNor', { nor }) });
-  } catch (err) { handleError(res, err); }
-});
 
 app.post('/lf/jorf/get', async (req, res) => {
   const nor = normalizeWhitespace(req.body?.nor || '');
@@ -778,7 +577,7 @@ app.post('/lf/jorf/get', async (req, res) => {
     if (nor) {
       const isTextCid = /^JORFTEXT/i.test(nor);
       const path = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
-      return res.json({ ok: true, mode: 'targeted_jorf', path_used: path, result: await callLegifrance(path, isTextCid ? { textId: nor } : { nor }) });
+      return res.json({ ok: true, mode: 'targeted_jorf', path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) });
     }
     res.json({ ok: true, mode: 'last_jo', path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: 5 }) });
   } catch (err) { handleError(res, err); }
@@ -795,7 +594,7 @@ app.post('/lf/consult/get-jo-with-nor', async (req, res) => {
   try {
     const isTextCid = /^JORFTEXT/i.test(nor);
     const path = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
-    res.json({ ok: true, path_used: path, result: await callLegifrance(path, isTextCid ? { textId: nor } : { nor }) });
+    res.json({ ok: true, path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) });
   } catch (err) { handleError(res, err); }
 });
 
@@ -947,7 +746,7 @@ app.post('/lf/consult/acco', async (req, res) => {
   } catch (err) { handleError(res, err); }
 });
 
-// ─── Jurisprudence Légifrance ────────────────────────────────────────────────
+// ─── Jurisprudence Légifrance (CETAT / CONSTIT / JUFI) ───────────────────────
 
 app.post('/lf/juri', async (req, res) => {
   const textId = normalizeWhitespace(req.body?.textId || '');
@@ -1092,7 +891,7 @@ app.use((_req, res) => {
   res.status(404).json({ ok: false, message: 'Endpoint introuvable. Voir GET /health.' });
 });
 
-// ─── Démarrage ────────────────────────────────────────────────────────────────
+// ─── Démarrage & arrêt propre ─────────────────────────────────────────────────
 
 validateEnv();
 const PORT   = process.env.PORT || 3000;
