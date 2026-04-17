@@ -1,7 +1,7 @@
 {
   "name": "proxy-avocat",
-  "version": "4.3.5",
-  "description": "Proxy unifié Légifrance + Judilibre pour avocat en contentieux — OAuth2 PISTE, retry, rerankage, production par défaut",
+  "version": "4.3.3",
+  "description": "Proxy unifié Légifrance + Judilibre pour avocat en contentieux — OAuth2 PISTE, retry, rerankage TEXTE→JUGE→ADMINISTRATION→PROCÉDURE, patch nearestVersion + garde-fous JORF",
   "main": "server.js",
   "type": "commonjs",
   "license": "UNLICENSED",
@@ -15,7 +15,10 @@
     "dev": "node --watch server.js",
     "dev:env": "node --env-file=.env --watch server.js",
     "start:env": "node --env-file=.env server.js",
-    "lint": "node --check server.js && echo 'Syntax OK'"
+    "start:patched": "node server_patched.js",
+    "dev:patched": "node --watch server_patched.js",
+    "lint": "node --check server.js && echo 'Syntax OK'",
+    "lint:patched": "node --check server_patched.js && echo 'Syntax OK'"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -27,7 +30,6 @@
     "piste",
     "droit",
     "contentieux",
-    "proxy",
-    "production"
+    "proxy"
   ]
 }
