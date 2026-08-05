@@ -17,10 +17,12 @@
 
 const express = require('express');
 const cors    = require('cors');
+const hardening = require('./hardening');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+app.use(hardening.responseGuard());
 
 const VERSION = 'v4.3.5-production';
 
@@ -181,11 +183,7 @@ async function callLegifrance(path, payload = {}, method = 'POST') {
 
 async function callJudilibre(path, queryParams = {}) {
   const token = await getToken(JD_CLIENT_ID, JD_CLIENT_SECRET);
-  const qs = new URLSearchParams(
-    Object.entries(queryParams)
-      .filter(([, v]) => v !== undefined && v !== null && v !== '')
-      .map(([k, v]) => [k, String(v)])
-  ).toString();
+  const qs = hardening.buildQueryString(queryParams);
   const url = JD_BASE + path + (qs ? '?' + qs : '');
 
   const options = {
@@ -513,13 +511,17 @@ app.post('/lf/article-resolve', async (req, res) => {
   const userQuery = normalizeWhitespace(req.body?.query || ((articleNumber ? 'article ' + articleNumber : '') + ' ' + codeTerms).trim());
   if (!userQuery) return res.status(400).json({ ok: false, message: 'articleNumber+codeTerms ou query est requis' });
   const normalized = normalizeSyntaxOnly(userQuery);
+  const parsed = hardening.parseArticleQuery(normalized);
+  const strictArticleNumber = articleNumber || parsed.articleNumber;
+  const strictCodeTerms = codeTerms || parsed.codeTerms;
   try {
-    const upstream = await callLegifrance('/search', buildSearchPayload(normalized, { fond: 'CODE_ETAT', pageSize: 5 }));
-    const best = (upstream.results || [])[0] || null;
+    const upstream = await callLegifrance('/search', buildSearchPayload(normalized, { fond: 'CODE_ETAT', pageSize: 25 }));
+    const best = hardening.selectStrictArticle(upstream.results || [], strictArticleNumber, strictCodeTerms);
     res.json({
-      ok: true,
+      ok: Boolean(best),
       returnedCount: best ? 1 : 0,
       bestMatch: best,
+      ...(best ? {} : { semanticWarning: 'Aucun résultat ne correspond strictement au numéro d’article et au code demandés.' }),
       query: normalized,
       routing: {
         user_query: userQuery,
@@ -547,8 +549,8 @@ app.post('/lf/article-fetch', async (req, res) => {
         return res.json({ ok: true, mode: 'consult_by_id_and_num', path_used: '/consult/getArticleWithIdAndNum', textId, article, query: 'article ' + articleNumber + ' ' + codeTerms });
       } catch (_) {}
     }
-    const sr = await callLegifrance('/search', buildSearchPayload('article ' + articleNumber + ' ' + codeTerms, { fond: 'CODE_ETAT', pageSize: 3 }));
-    const best = (sr.results || [])[0] || null;
+    const sr = await callLegifrance('/search', buildSearchPayload('article ' + articleNumber + ' ' + codeTerms, { fond: 'CODE_ETAT', pageSize: 25 }));
+    const best = hardening.selectStrictArticle(sr.results || [], articleNumber, codeTerms);
     if (best?.id && /^LEGIARTI/i.test(best.id)) {
       const full = await callLegifrance('/consult/getArticle', { id: best.id });
       return res.json({ ok: true, mode: 'consult_by_legiarti', path_used: '/consult/getArticle', article: full, query: 'article ' + articleNumber + ' ' + codeTerms });
@@ -562,10 +564,21 @@ app.post('/lf/article-fetch', async (req, res) => {
 app.post('/lf/consult/article-by-cid', async (req, res) => {
   const cid = normalizeWhitespace(req.body?.cid || '');
   if (!cid) return res.status(400).json({ ok: false, message: 'cid est requis' });
+  let primaryError = null;
   try {
-    res.json({ ok: true, path_used: '/consult/getArticleByCid', cid, ...(await callLegifrance('/consult/getArticleByCid', { cid })) });
+    const primary = await callLegifrance('/consult/getArticleByCid', { cid });
+    const items = hardening.collectionOf(primary);
+    if (items.length || primary.article || primary.text || primary.texte) {
+      return hardening.safeSend(res, { ok: true, path_used: '/consult/getArticleByCid', cid, fallback_used: false, ...primary }, { includeText: true, limit: 10 });
+    }
   } catch (err) {
-    handleError(res, err);
+    primaryError = err;
+  }
+  try {
+    const fallback = await callLegifrance('/consult/getArticle', { id: cid });
+    return hardening.safeSend(res, { ok: true, path_used: '/consult/getArticle', cid, fallback_used: true, result: fallback }, { includeText: true, limit: 10 });
+  } catch (fallbackError) {
+    handleError(res, primaryError || fallbackError);
   }
 });
 
@@ -627,7 +640,7 @@ app.post('/lf/code-resolve', async (req, res) => {
     const textId = codeEntry?.cid || codeEntry?.id || null;
     if (!textId) return res.status(404).json({ ok: false, message: 'Code introuvable: ' + codeTerms });
     const outline = await callLegifrance('/consult/legi/tableMatieres', { textId, date: today(), nature: 'CODE' });
-    res.json({ ok: true, mode: 'table_matieres', textId, code: codeEntry, outline: outline.sections || outline.elements || outline, query_used: { codeTerms, textId, date: today() } });
+    hardening.safeSend(res, { ok: true, mode: 'table_matieres', textId, code: codeEntry, outline: outline.sections || outline.elements || outline, query_used: { codeTerms, textId, date: today() } }, { includeText: false, limit: Math.min(Number(req.body?.limit || 50), 100), maxDepth: Math.min(Number(req.body?.depth || 4), 8) });
   } catch (err) {
     handleError(res, err);
   }
@@ -646,7 +659,7 @@ app.post('/lf/consult/code', async (req, res) => {
       ...(req.body?.sctCid ? { sctCid: req.body.sctCid } : {}),
       ...(req.body?.abrogated ? { abrogated: req.body.abrogated } : {}),
     });
-    res.json({ ok: true, path_used: '/consult/code', textId: resolvedId, date, result });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/code', textId: resolvedId, date, result }, { includeText: req.body?.includeText === true, limit: Math.min(Number(req.body?.limit || 50), 100), maxDepth: Math.min(Number(req.body?.depth || 4), 8) });
   } catch (err) {
     handleError(res, err);
   }
@@ -689,10 +702,19 @@ app.post('/lf/search/canonical-article', async (req, res) => {
 app.post('/lf/search/nearest-version', async (req, res) => {
   const { textId, date } = req.body || {};
   if (!textId) return res.status(400).json({ ok: false, message: 'textId est requis' });
+  const targetDate = normalizeWhitespace(date || today());
   try {
-    res.json({ ok: true, path_used: '/search/nearestVersion', ...(await callLegifrance('/search/nearestVersion', { textId, date: normalizeWhitespace(date || today()) })) });
+    const nearest = await callLegifrance('/search/nearestVersion', { textId, date: targetDate });
+    return hardening.safeSend(res, { ok: true, path_used: '/search/nearestVersion', fallback_used: false, ...nearest }, { includeText: true, limit: 20 });
   } catch (err) {
-    handleError(res, err);
+    try {
+      const history = await callLegifrance('/chrono/textCid/' + encodeURIComponent(textId), {}, 'GET');
+      const selected = hardening.selectApplicableVersion(history, targetDate);
+      if (!selected) throw err;
+      return hardening.safeSend(res, { ok: true, path_used: '/chrono/textCid/' + textId, fallback_used: true, applicable_date: targetDate, version: selected }, { includeText: true, limit: 20 });
+    } catch (_) {
+      handleError(res, err);
+    }
   }
 });
 
@@ -704,9 +726,9 @@ app.post('/lf/jorf/get', async (req, res) => {
     if (nor) {
       const isTextCid = /^JORFTEXT/i.test(nor);
       const path = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
-      return res.json({ ok: true, mode: 'targeted_jorf', path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) });
+      return hardening.safeSend(res, { ok: true, mode: 'targeted_jorf', path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) }, { includeText: req.body?.includeText === true, limit: Math.min(Number(req.body?.limit || 10), 50), maxDepth: 4 });
     }
-    res.json({ ok: true, mode: 'last_jo', path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: 5 }) });
+    hardening.safeSend(res, { ok: true, mode: 'last_jo', path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: Math.min(Number(req.body?.nbElement || 5), 20) }) }, { includeText: false, limit: 20, maxDepth: 4 });
   } catch (err) {
     handleError(res, err);
   }
@@ -714,7 +736,7 @@ app.post('/lf/jorf/get', async (req, res) => {
 
 app.post('/lf/consult/last-n-jo', async (req, res) => {
   try {
-    res.json({ ok: true, path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: Math.min(Number(req.body?.nbElement || 10), 100) }) });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/lastNJo', result: await callLegifrance('/consult/lastNJo', { nbElement: Math.min(Number(req.body?.nbElement || 10), 50) }) }, { includeText: false, limit: 50, maxDepth: 4 });
   } catch (err) {
     handleError(res, err);
   }
@@ -726,7 +748,7 @@ app.post('/lf/consult/get-jo-with-nor', async (req, res) => {
   try {
     const isTextCid = /^JORFTEXT/i.test(nor);
     const path = isTextCid ? '/consult/jorf' : '/consult/getJoWithNor';
-    res.json({ ok: true, path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) });
+    hardening.safeSend(res, { ok: true, path_used: path, result: await callLegifrance(path, isTextCid ? { textCid: nor } : { nor }) }, { includeText: req.body?.includeText === true, limit: Math.min(Number(req.body?.limit || 10), 50), maxDepth: 4 });
   } catch (err) {
     handleError(res, err);
   }
@@ -869,7 +891,7 @@ app.post('/lf/consult/kali-text', async (req, res) => {
   try {
     const kaliId = id || await resolveKaliId(query);
     if (!kaliId) return res.status(404).json({ ok: false, message: 'Convention introuvable: ' + query });
-    res.json({ ok: true, path_used: '/consult/kaliText', id: kaliId, result: await callLegifrance('/consult/kaliText', { id: kaliId }) });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/kaliText', id: kaliId, result: await callLegifrance('/consult/kaliText', { id: kaliId }) }, { includeText: req.body?.includeText === true, limit: Math.min(Number(req.body?.limit || 20), 100), maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -882,7 +904,7 @@ app.post('/lf/consult/kali-cont', async (req, res) => {
   try {
     const kaliId = id || await resolveKaliId(query);
     if (!kaliId) return res.status(404).json({ ok: false, message: 'Convention introuvable: ' + query });
-    res.json({ ok: true, path_used: '/consult/kaliCont', id: kaliId, result: await callLegifrance('/consult/kaliCont', { id: kaliId, ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}) }) });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/kaliCont', id: kaliId, result: await callLegifrance('/consult/kaliCont', { id: kaliId, ...(req.body?.searchedString ? { searchedString: req.body.searchedString } : {}) }) }, { includeText: req.body?.includeText === true, limit: Math.min(Number(req.body?.limit || 50), 100), maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -892,7 +914,7 @@ app.post('/lf/consult/kali-cont-idcc', async (req, res) => {
   const id = normalizeWhitespace(req.body?.idcc || req.body?.id || '');
   if (!id) return res.status(400).json({ ok: false, message: 'idcc (ou id) est requis' });
   try {
-    res.json({ ok: true, path_used: '/consult/kaliContIdcc', id, result: await callLegifrance('/consult/kaliContIdcc', { id }) });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/kaliContIdcc', id, result: await callLegifrance('/consult/kaliContIdcc', { id }) }, { includeText: false, limit: Math.min(Number(req.body?.limit || 50), 100), maxDepth: Math.min(Number(req.body?.depth || 4), 8) });
   } catch (err) {
     handleError(res, err);
   }
@@ -902,7 +924,7 @@ app.post('/lf/consult/kali-section', async (req, res) => {
   const id = normalizeWhitespace(req.body?.id || '');
   if (!id) return res.status(400).json({ ok: false, message: 'id est requis (identifiant de section KALI)' });
   try {
-    res.json({ ok: true, path_used: '/consult/kaliSection', id, result: await callLegifrance('/consult/kaliSection', { id }) });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/kaliSection', id, result: await callLegifrance('/consult/kaliSection', { id }) }, { includeText: false, limit: Math.min(Number(req.body?.limit || 50), 100), maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -912,7 +934,7 @@ app.post('/lf/consult/kali-article', async (req, res) => {
   const id = normalizeWhitespace(req.body?.id || '');
   if (!id) return res.status(400).json({ ok: false, message: 'id est requis (identifiant article KALI)' });
   try {
-    res.json({ ok: true, path_used: '/consult/kaliArticle', id, result: await callLegifrance('/consult/kaliArticle', { id }) });
+    hardening.safeSend(res, { ok: true, path_used: '/consult/kaliArticle', id, result: await callLegifrance('/consult/kaliArticle', { id }) }, { includeText: true, limit: 5, maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -996,7 +1018,11 @@ app.get('/jd/search', async (req, res) => {
       ...(req.query?.withFileOfType ? { withFileOfType: req.query.withFileOfType } : {}),
       ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
     };
-    res.json({ ok: true, path_used: '/search', ...(await callJudilibre('/search', params)), routing: { user_query: req.query.query, normalized_query: query, intent: 'JURISPRUDENCE', endpoint_called: '/jd/search' } });
+    const dateError = hardening.validateDateRange(req.query?.date_start, req.query?.date_end);
+    if (dateError) return res.status(400).json({ ok: false, message: dateError });
+    const upstream = await callJudilibre('/search', params);
+    const validated = hardening.filterJudilibreResults(upstream, { chamber: req.query?.chamber, solution: req.query?.solution, date_start: req.query?.date_start, date_end: req.query?.date_end });
+    hardening.safeSend(res, { ok: true, path_used: '/search', ...validated, routing: { user_query: req.query.query, normalized_query: query, intent: 'JURISPRUDENCE', endpoint_called: '/jd/search' } }, { includeText: true, limit: Math.min(Number(req.query?.page_size || 10), 100), maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -1022,7 +1048,7 @@ app.get('/jd/scan', async (req, res) => {
       ...(req.query?.publication ? { publication: req.query.publication } : {}),
       ...(req.query?.date_start ? { date_start: req.query.date_start } : {}),
       ...(req.query?.date_end ? { date_end: req.query.date_end } : {}),
-      ...(req.query?.date_type ? { date_type: req.query.date_type } : {}),
+      date_type: req.query?.date_type || 'decision',
       ...(req.query?.order ? { order: req.query.order } : {}),
       ...(req.query?.batch_size ? { batch_size: Number(req.query.batch_size) } : {}),
       ...(req.query?.search_after ? { search_after: req.query.search_after } : {}),
@@ -1031,7 +1057,11 @@ app.get('/jd/scan', async (req, res) => {
       ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
       ...(req.query?.withFileOfType ? { withFileOfType: req.query.withFileOfType } : {}),
     };
-    res.json({ ok: true, path_used: '/scan', ...(await callJudilibre('/scan', params)) });
+    const dateError = hardening.validateDateRange(req.query?.date_start, req.query?.date_end);
+    if (dateError) return res.status(400).json({ ok: false, message: dateError });
+    const upstream = await callJudilibre('/scan', params);
+    const validated = hardening.filterJudilibreResults(upstream, { chamber: req.query?.chamber, solution: req.query?.solution, date_start: req.query?.date_start, date_end: req.query?.date_end });
+    hardening.safeSend(res, { ok: true, path_used: '/scan', ...validated }, { includeText: String(req.query?.abridged || 'false') !== 'true', limit: Math.min(Number(req.query?.batch_size || 100), 1000), maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -1046,7 +1076,7 @@ app.get('/jd/export', async (req, res) => {
       ...(req.query?.solution ? { solution: req.query.solution } : {}),
       ...(req.query?.date_start ? { date_start: req.query.date_start } : {}),
       ...(req.query?.date_end ? { date_end: req.query.date_end } : {}),
-      ...(req.query?.date_type ? { date_type: req.query.date_type } : {}),
+      date_type: req.query?.date_type || 'decision',
       ...(req.query?.order ? { order: req.query.order } : {}),
       ...(req.query?.batch_size ? { batch_size: Number(req.query.batch_size) } : {}),
       ...(req.query?.batch ? { batch: Number(req.query.batch) } : {}),
@@ -1054,7 +1084,11 @@ app.get('/jd/export', async (req, res) => {
       ...(req.query?.abridged ? { abridged: req.query.abridged } : {}),
       ...(req.query?.withFileOfType ? { withFileOfType: req.query.withFileOfType } : {}),
     };
-    res.json({ ok: true, path_used: '/export', ...(await callJudilibre('/export', params)) });
+    const dateError = hardening.validateDateRange(req.query?.date_start, req.query?.date_end);
+    if (dateError) return res.status(400).json({ ok: false, message: dateError });
+    const upstream = await callJudilibre('/export', params);
+    const validated = hardening.filterJudilibreResults(upstream, { chamber: req.query?.chamber, solution: req.query?.solution, date_start: req.query?.date_start, date_end: req.query?.date_end });
+    hardening.safeSend(res, { ok: true, path_used: '/export', ...validated }, { includeText: String(req.query?.abridged || 'false') !== 'true', limit: Math.min(Number(req.query?.batch_size || 100), 1000), maxDepth: 5 });
   } catch (err) {
     handleError(res, err);
   }
@@ -1082,7 +1116,7 @@ app.get('/jd/stats', async (req, res) => {
       ...(req.query?.date_start ? { date_start: req.query.date_start } : {}),
       ...(req.query?.date_end ? { date_end: req.query.date_end } : {}),
       ...(req.query?.particularInterest ? { particularInterest: req.query.particularInterest } : {}),
-      ...(req.query?.keys ? { keys: req.query.keys } : {}),
+      ...(req.query?.keys ? { keys: String(req.query.keys).split(',').map(v => v.trim()).filter(Boolean) } : {}),
     };
     res.json({ ok: true, path_used: '/stats', ...(await callJudilibre('/stats', params)) });
   } catch (err) {
