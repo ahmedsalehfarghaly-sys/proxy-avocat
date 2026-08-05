@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, fix/hardening-30-operations]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      INTEGRATION_BASE_URL: https://proxy-avocat.onrender.com
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run unit tests
+        run: npm test
+      - name: Run lint
+        run: npm run lint
+      - name: Verify route inventory
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          git show "origin/${{ github.base_ref }}:server.js" | grep -Eo "app\.(get|post|put|patch|delete)\('[^']+'" | sort > /tmp/routes-before
+          grep -Eo "app\.(get|post|put|patch|delete)\('[^']+'" server.js | sort > /tmp/routes-after
+          diff -u /tmp/routes-before /tmp/routes-after
+      - name: Run deployed integration tests
+        run: npm run test:integration
